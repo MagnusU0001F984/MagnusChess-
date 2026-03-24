@@ -33,7 +33,6 @@ black pieces reuse the same values by flipping squares vertically with sq ^ 56.
 #include "Evaluation.h"
 
 #include <array>
-#include <bit>
 
 namespace valerain::eval {
 
@@ -186,63 +185,82 @@ constexpr Square flip_vertical(Square sq) noexcept {
     return sq ^ 56;
 }
 
-inline Square pop_lsb(Bitboard& bb) noexcept {
-    const Square sq = static_cast<Square>(std::countr_zero(static_cast<u64>(bb)));
-    bb &= bb - 1;
-    return sq;
+constexpr Square orient_square(Color color, Square sq) noexcept {
+    return color == WHITE ? sq : flip_vertical(sq);
 }
 
-inline void accumulate_piece_type(
-    const Position& pos,
+inline void add_piece_value(
+    Position& pos,
     Color color,
-    PieceType pt,
-    int (&mg)[COLOR_NB],
-    int (&eg)[COLOR_NB],
-    int& phase
+    PieceType piece_type,
+    Square sq
 ) noexcept {
-    Bitboard bb = pieces(pos, color, pt);
     const int side = static_cast<int>(color);
+    const Square table_sq = orient_square(color, sq);
 
-    while (bb) {
-        const Square sq = pop_lsb(bb);
-        const Square table_sq = color == WHITE ? sq : flip_vertical(sq);
-
-        mg[side] += mg_table[pt][table_sq];
-        eg[side] += eg_table[pt][table_sq];
-        phase += phase_inc[pt];
-    }
+    pos.eval_mg[side] += mg_table[piece_type][table_sq];
+    pos.eval_eg[side] += eg_table[piece_type][table_sq];
+    pos.eval_phase += phase_inc[piece_type];
 }
 
-inline void accumulate_side(
-    const Position& pos,
+inline void remove_piece_value(
+    Position& pos,
     Color color,
-    int (&mg)[COLOR_NB],
-    int (&eg)[COLOR_NB],
-    int& phase
+    PieceType piece_type,
+    Square sq
 ) noexcept {
-    accumulate_piece_type(pos, color, PAWN, mg, eg, phase);
-    accumulate_piece_type(pos, color, KNIGHT, mg, eg, phase);
-    accumulate_piece_type(pos, color, BISHOP, mg, eg, phase);
-    accumulate_piece_type(pos, color, ROOK, mg, eg, phase);
-    accumulate_piece_type(pos, color, QUEEN, mg, eg, phase);
-    accumulate_piece_type(pos, color, KING, mg, eg, phase);
+    const int side = static_cast<int>(color);
+    const Square table_sq = orient_square(color, sq);
+
+    pos.eval_mg[side] -= mg_table[piece_type][table_sq];
+    pos.eval_eg[side] -= eg_table[piece_type][table_sq];
+    pos.eval_phase -= phase_inc[piece_type];
 }
 
 } // namespace
 
+void on_piece_added(
+    Position& pos,
+    Color color,
+    PieceType piece_type,
+    Square sq
+) noexcept {
+    add_piece_value(pos, color, piece_type, sq);
+}
+
+void on_piece_removed(
+    Position& pos,
+    Color color,
+    PieceType piece_type,
+    Square sq
+) noexcept {
+    remove_piece_value(pos, color, piece_type, sq);
+}
+
+void on_piece_moved(
+    Position& pos,
+    Color color,
+    PieceType piece_type,
+    Square from,
+    Square to
+) noexcept {
+    const int side = static_cast<int>(color);
+    const Square from_sq = orient_square(color, from);
+    const Square to_sq = orient_square(color, to);
+
+    pos.eval_mg[side] += mg_table[piece_type][to_sq] - mg_table[piece_type][from_sq];
+    pos.eval_eg[side] += eg_table[piece_type][to_sq] - eg_table[piece_type][from_sq];
+}
+
 Score evaluate(const Position& pos) noexcept {
-    int mg[COLOR_NB] = {};
-    int eg[COLOR_NB] = {};
-    int phase = 0;
-
-    accumulate_side(pos, WHITE, mg, eg, phase);
-    accumulate_side(pos, BLACK, mg, eg, phase);
-
+    int phase = pos.eval_phase;
+    if (phase < 0)
+        phase = 0;
     if (phase > TOTAL_PHASE)
         phase = TOTAL_PHASE;
 
-    const int mg_score = mg[WHITE] - mg[BLACK];
-    const int eg_score = eg[WHITE] - eg[BLACK];
+    const int mg_score = pos.eval_mg[WHITE] - pos.eval_mg[BLACK];
+    const int eg_score = pos.eval_eg[WHITE] - pos.eval_eg[BLACK];
     const int white_pov =
         (mg_score * phase + eg_score * (TOTAL_PHASE - phase)) / TOTAL_PHASE;
 

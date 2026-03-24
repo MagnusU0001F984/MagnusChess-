@@ -23,6 +23,7 @@ SOFTWARE.
 */
 
 #include "Position.h"
+#include "Evaluation.h"
 #include "MoveGen.h"
 
 #include <bit>
@@ -67,6 +68,11 @@ void position_clear(Position& pos) noexcept {
         pos.piece_bb[pt] = 0ULL;
 
     pos.occupied = 0ULL;
+    pos.eval_mg[WHITE] = 0;
+    pos.eval_mg[BLACK] = 0;
+    pos.eval_eg[WHITE] = 0;
+    pos.eval_eg[BLACK] = 0;
+    pos.eval_phase = 0;
 
     for (int sq = 0; sq < SQ_NB; ++sq)
         pos.board[sq] = PIECE_NONE;
@@ -99,6 +105,7 @@ void position_put_piece(
     pos.piece_bb[piece_type] |= bb;
     pos.occupied |= bb;
     pos.board[sq] = static_cast<int>(make_piece(color, piece_type));
+    eval::on_piece_added(pos, color, piece_type, sq);
 
     if (piece_type == KING)
         pos.king_sq[color] = sq;
@@ -116,6 +123,7 @@ void position_remove_piece(
     pos.piece_bb[piece_type] &= ~bb;
     pos.occupied &= ~bb;
     pos.board[sq] = PIECE_NONE;
+    eval::on_piece_removed(pos, color, piece_type, sq);
 
     if (piece_type == KING)
         pos.king_sq[color] = NO_SQ;
@@ -137,6 +145,7 @@ void position_move_piece(
 
     pos.board[from] = PIECE_NONE;
     pos.board[to] = static_cast<int>(make_piece(color, piece_type));
+    eval::on_piece_moved(pos, color, piece_type, from, to);
 
     if (piece_type == KING)
         pos.king_sq[color] = to;

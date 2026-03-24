@@ -41,6 +41,10 @@ struct Position {
     Bitboard piece_bb[PIECE_NB]{};
     Bitboard occupied = 0ULL;
 
+    int eval_mg[COLOR_NB]{};
+    int eval_eg[COLOR_NB]{};
+    int eval_phase = 0;
+
     int board[SQ_NB];
 };
 

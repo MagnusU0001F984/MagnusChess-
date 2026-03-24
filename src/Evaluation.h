@@ -29,6 +29,28 @@ SOFTWARE.
 
 namespace valerain::eval {
 
+void on_piece_added(
+    Position& pos,
+    Color color,
+    PieceType piece_type,
+    Square sq
+) noexcept;
+
+void on_piece_removed(
+    Position& pos,
+    Color color,
+    PieceType piece_type,
+    Square sq
+) noexcept;
+
+void on_piece_moved(
+    Position& pos,
+    Color color,
+    PieceType piece_type,
+    Square from,
+    Square to
+) noexcept;
+
 Score evaluate(const Position& pos) noexcept;
 
 } // namespace valerain::eval
