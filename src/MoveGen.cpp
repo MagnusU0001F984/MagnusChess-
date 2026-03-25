@@ -594,6 +594,181 @@ inline Move* generate_pawn_non_evasions(
         : generate_black_pawn_non_evasions(pos, info, out);
 }
 
+inline Move* generate_king_captures(
+    const Position&,
+    const memory::Memory& mem,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    const Square from = info.king_sq;
+    Bitboard mask = king_attacks(mem, from);
+    mask &= info.them_occ;
+    mask &= ~info.danger;
+    return append_moves_from_mask(from, mask, info.them_occ, out);
+}
+
+inline Move* generate_knight_captures(
+    const Position& pos,
+    const memory::Memory& mem,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    Bitboard knights = pieces_bb(pos, info.us, KNIGHT);
+
+    while (knights) {
+        const Square from = lsb_sq(knights);
+        knights &= knights - 1;
+
+        Bitboard mask = knight_attacks(mem, from);
+        mask &= info.them_occ;
+
+        out = append_moves_from_mask(from, mask, info.them_occ, out);
+    }
+
+    return out;
+}
+
+inline Move* generate_bishop_captures(
+    const Position& pos,
+    const memory::Memory& mem,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    Bitboard bishops = pieces_bb(pos, info.us, BISHOP);
+
+    while (bishops) {
+        const Square from = lsb_sq(bishops);
+        bishops &= bishops - 1;
+
+        Bitboard mask = bishop_attacks(mem, from, info.occupied);
+        mask &= info.them_occ;
+
+        out = append_moves_from_mask(from, mask, info.them_occ, out);
+    }
+
+    return out;
+}
+
+inline Move* generate_rook_captures(
+    const Position& pos,
+    const memory::Memory& mem,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    Bitboard rooks = pieces_bb(pos, info.us, ROOK);
+
+    while (rooks) {
+        const Square from = lsb_sq(rooks);
+        rooks &= rooks - 1;
+
+        Bitboard mask = rook_attacks(mem, from, info.occupied);
+        mask &= info.them_occ;
+
+        out = append_moves_from_mask(from, mask, info.them_occ, out);
+    }
+
+    return out;
+}
+
+inline Move* generate_queen_captures(
+    const Position& pos,
+    const memory::Memory& mem,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    Bitboard queens = pieces_bb(pos, info.us, QUEEN);
+
+    while (queens) {
+        const Square from = lsb_sq(queens);
+        queens &= queens - 1;
+
+        Bitboard mask = queen_attacks(mem, from, info.occupied);
+        mask &= info.them_occ;
+
+        out = append_moves_from_mask(from, mask, info.them_occ, out);
+    }
+
+    return out;
+}
+
+inline Move* generate_white_pawn_captures(
+    const Position& pos,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    Bitboard pawns = pieces_bb(pos, WHITE, PAWN);
+
+    while (pawns) {
+        const Square from = lsb_sq(pawns);
+        pawns &= pawns - 1;
+
+        const int r = rank_of(from);
+        const int f = file_of(from);
+
+        if (f > 0) {
+            const Square to = from + 7;
+            if ((info.them_occ & bb_of(to)) != 0ULL) {
+                if (r == 6) out = append_promotion_moves(from, to, true, out);
+                else        *out++ = make_move(from, to, MOVE_CAPTURE);
+            }
+        }
+
+        if (f < 7) {
+            const Square to = from + 9;
+            if ((info.them_occ & bb_of(to)) != 0ULL) {
+                if (r == 6) out = append_promotion_moves(from, to, true, out);
+                else        *out++ = make_move(from, to, MOVE_CAPTURE);
+            }
+        }
+    }
+
+    return out;
+}
+
+inline Move* generate_black_pawn_captures(
+    const Position& pos,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    Bitboard pawns = pieces_bb(pos, BLACK, PAWN);
+
+    while (pawns) {
+        const Square from = lsb_sq(pawns);
+        pawns &= pawns - 1;
+
+        const int r = rank_of(from);
+        const int f = file_of(from);
+
+        if (f > 0) {
+            const Square to = from - 9;
+            if ((info.them_occ & bb_of(to)) != 0ULL) {
+                if (r == 1) out = append_promotion_moves(from, to, true, out);
+                else        *out++ = make_move(from, to, MOVE_CAPTURE);
+            }
+        }
+
+        if (f < 7) {
+            const Square to = from - 7;
+            if ((info.them_occ & bb_of(to)) != 0ULL) {
+                if (r == 1) out = append_promotion_moves(from, to, true, out);
+                else        *out++ = make_move(from, to, MOVE_CAPTURE);
+            }
+        }
+    }
+
+    return out;
+}
+
+inline Move* generate_pawn_captures(
+    const Position& pos,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    return info.us == WHITE
+        ? generate_white_pawn_captures(pos, info, out)
+        : generate_black_pawn_captures(pos, info, out);
+}
+
 inline Move* generate_ep_non_evasions(
     const Position& pos,
     const memory::Memory& mem,
@@ -618,6 +793,22 @@ inline Move* generate_ep_non_evasions(
         *out++ = make_move(from, info.ep_sq, MOVE_EP);
     }
 
+    return out;
+}
+
+inline Move* generate_capture_non_evasions_with_info(
+    const Position& pos,
+    const memory::Memory& mem,
+    const GenInfo& info,
+    Move* out
+) noexcept {
+    out = generate_king_captures(pos, mem, info, out);
+    out = generate_knight_captures(pos, mem, info, out);
+    out = generate_bishop_captures(pos, mem, info, out);
+    out = generate_rook_captures(pos, mem, info, out);
+    out = generate_queen_captures(pos, mem, info, out);
+    out = generate_pawn_captures(pos, info, out);
+    out = generate_ep_non_evasions(pos, mem, info, out);
     return out;
 }
 
@@ -733,7 +924,7 @@ inline void compute_pinners_and_pinned(
 }
 
 inline bool legal_slow(
-    const Position& pos,
+    Position& pos,
     const memory::Memory& mem,
     Move m
 ) noexcept {
@@ -743,15 +934,18 @@ inline bool legal_slow(
     const Color us   = static_cast<Color>(pos.side_to_move);
     const Color them = (us == WHITE ? BLACK : WHITE);
 
-    Position next = pos;
-    do_move_copy(next, m);
+    StateInfo st{};
+    make_move(pos, m, mem.tables, st);
 
-    const Square ksq = next.king_sq[us];
-    return attackers_to_color(next, mem, ksq, them, next.occupied) == 0ULL;
+    const Square ksq = pos.king_sq[us];
+    const bool legal = attackers_to_color(pos, mem, ksq, them, pos.occupied) == 0ULL;
+
+    unmake_move(pos, m, mem.tables, st);
+    return legal;
 }
 
 inline bool legal_fast(
-    const Position& pos,
+    Position& pos,
     const memory::Memory& mem,
     const GenInfo& info,
     Move m
@@ -974,7 +1168,33 @@ bool legal(
     const memory::Memory& mem,
     Move m
 ) noexcept {
-    return legal_slow(pos, mem, m);
+    Position work = pos;
+    return legal_slow(work, mem, m);
+}
+
+Move* generate_captures(
+    Position& pos,
+    const memory::Memory& mem,
+    Move* out
+) noexcept {
+    // In non-check nodes, avoid full pseudo generation and build capture
+    // candidates directly for qsearch.
+    GenInfo info{};
+    init_gen_info(info, pos, mem);
+
+    Move pseudo[MAX_MOVES];
+    Move* mid = info.in_check
+        ? generate_evasions_with_info(pos, mem, info, pseudo)
+        : generate_capture_non_evasions_with_info(pos, mem, info, pseudo);
+
+    for (Move* it = pseudo; it != mid; ++it) {
+        if (!move_is_capture(*it))
+            continue;
+        if (legal_fast(pos, mem, info, *it))
+            *out++ = *it;
+    }
+
+    return out;
 }
 
 Move* generate_captures(
@@ -982,16 +1202,8 @@ Move* generate_captures(
     const memory::Memory& mem,
     Move* out
 ) noexcept {
-    // The current interface derives captures from the full legal list for simplicity.
-    Move legal_list[MAX_MOVES];
-    Move* end = generate_legal(pos, mem, legal_list);
-
-    for (Move* it = legal_list; it != end; ++it) {
-        if (move_is_capture(*it))
-            *out++ = *it;
-    }
-
-    return out;
+    Position work = pos;
+    return generate_captures(work, mem, out);
 }
 
 Move* generate_quiets(
@@ -999,11 +1211,17 @@ Move* generate_quiets(
     const memory::Memory& mem,
     Move* out
 ) noexcept {
-    Move legal_list[MAX_MOVES];
-    Move* end = generate_legal(pos, mem, legal_list);
+    GenInfo info{};
+    init_gen_info(info, pos, mem);
 
-    for (Move* it = legal_list; it != end; ++it) {
-        if (!move_is_capture(*it))
+    Move pseudo[MAX_MOVES];
+    Move* mid = generate_pseudo_legal_with_info(pos, mem, info, pseudo);
+    Position work = pos;
+
+    for (Move* it = pseudo; it != mid; ++it) {
+        if (move_is_capture(*it))
+            continue;
+        if (legal_fast(work, mem, info, *it))
             *out++ = *it;
     }
 
@@ -1049,7 +1267,7 @@ Move* generate_pseudo_legal(
 }
 
 Move* generate_legal(
-    const Position& pos,
+    Position& pos,
     const memory::Memory& mem,
     Move* out
 ) noexcept {
@@ -1060,13 +1278,21 @@ Move* generate_legal(
 
     Move pseudo[MAX_MOVES];
     Move* mid = generate_pseudo_legal_with_info(pos, mem, info, pseudo);
-
     for (Move* it = pseudo; it != mid; ++it) {
         if (legal_fast(pos, mem, info, *it))
             *out++ = *it;
     }
 
     return out;
+}
+
+Move* generate_legal(
+    const Position& pos,
+    const memory::Memory& mem,
+    Move* out
+) noexcept {
+    Position work = pos;
+    return generate_legal(work, mem, out);
 }
 
 Move* generate(

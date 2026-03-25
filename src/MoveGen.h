@@ -260,6 +260,12 @@ bool legal(
     Core generation API
 */
 Move* generate_captures(
+    Position& pos,
+    const memory::Memory& mem,
+    Move* out
+) noexcept;
+
+Move* generate_captures(
     const Position& pos,
     const memory::Memory& mem,
     Move* out
@@ -290,10 +296,25 @@ Move* generate_pseudo_legal(
 ) noexcept;
 
 Move* generate_legal(
+    Position& pos,
+    const memory::Memory& mem,
+    Move* out
+) noexcept;
+
+Move* generate_legal(
     const Position& pos,
     const memory::Memory& mem,
     Move* out
 ) noexcept;
+
+inline void generate_captures(
+    Position& pos,
+    const memory::Memory& mem,
+    MoveList& list
+) noexcept {
+    Move* end = generate_captures(pos, mem, list.moves);
+    list.size = static_cast<int>(end - list.moves);
+}
 
 inline void generate_captures(
     const Position& pos,
@@ -337,6 +358,15 @@ inline void generate_pseudo_legal(
     MoveList& list
 ) noexcept {
     Move* end = generate_pseudo_legal(pos, mem, list.moves);
+    list.size = static_cast<int>(end - list.moves);
+}
+
+inline void generate_legal(
+    Position& pos,
+    const memory::Memory& mem,
+    MoveList& list
+) noexcept {
+    Move* end = generate_legal(pos, mem, list.moves);
     list.size = static_cast<int>(end - list.moves);
 }
 

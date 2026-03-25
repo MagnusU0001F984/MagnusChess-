@@ -25,6 +25,7 @@ SOFTWARE.
 #include "Uci.h"
 
 #include <algorithm>
+#include <chrono>
 #include <charconv>
 #include <cctype>
 #include <filesystem>
@@ -40,6 +41,7 @@ SOFTWARE.
 #include "MoveGen.h"
 #include "Nnue.h"
 #include "Search.h"
+#include "Time.h"
 
 /*
 This file implements the engine's minimal UCI front-end. It parses commands,
@@ -421,27 +423,16 @@ void handle_setoption(
 
 [[nodiscard]] bool parse_go_command(
     const Position& pos,
+    timeman::TimeManager& time_manager,
     std::string_view command,
     search::SearchLimits& limits
 ) noexcept {
-    // Convert the UCI go command into depth/node/time limits understood by the
-    // synchronous search loop.
+    // Convert the UCI go command into normalized parameters, then let the time
+    // manager derive final soft/hard budgets (with historical adjustment).
     std::istringstream iss{std::string(command)};
     std::string token;
-    limits.depth = search::MAX_PLY;
-    limits.node_limit = 0;
-    limits.soft_time_ms = 0;
-    limits.hard_time_ms = 0;
-    limits.infinite = false;
 
-    int depth = 0;
-    int movetime = 0;
-    int wtime = 0;
-    int btime = 0;
-    int winc = 0;
-    int binc = 0;
-    int movestogo = 0;
-    u64 nodes = 0;
+    timeman::GoParams params{};
     bool has_limit = false;
 
     iss >> token; // go
@@ -452,7 +443,7 @@ void handle_setoption(
             if (iss >> value) {
                 int parsed = 0;
                 if (parse_int(value, parsed) && parsed > 0) {
-                    depth = parsed;
+                    params.depth = parsed;
                     has_limit = true;
                 }
                 else
@@ -463,55 +454,55 @@ void handle_setoption(
         }
         else if (token == "nodes") {
             std::string value;
-            if (iss >> value && parse_u64(value, nodes) && nodes > 0)
+            if (iss >> value && parse_u64(value, params.nodes) && params.nodes > 0)
                 has_limit = true;
             else
                 return false;
         }
         else if (token == "movetime") {
             std::string value;
-            if (iss >> value && parse_int(value, movetime) && movetime > 0)
+            if (iss >> value && parse_int(value, params.movetime) && params.movetime > 0)
                 has_limit = true;
             else
                 return false;
         }
         else if (token == "wtime") {
             std::string value;
-            if (iss >> value && parse_int(value, wtime))
+            if (iss >> value && parse_int(value, params.wtime))
                 has_limit = true;
             else
                 return false;
         }
         else if (token == "btime") {
             std::string value;
-            if (iss >> value && parse_int(value, btime))
+            if (iss >> value && parse_int(value, params.btime))
                 has_limit = true;
             else
                 return false;
         }
         else if (token == "winc") {
             std::string value;
-            if (iss >> value && parse_int(value, winc))
+            if (iss >> value && parse_int(value, params.winc))
                 has_limit = true;
             else
                 return false;
         }
         else if (token == "binc") {
             std::string value;
-            if (iss >> value && parse_int(value, binc))
+            if (iss >> value && parse_int(value, params.binc))
                 has_limit = true;
             else
                 return false;
         }
         else if (token == "movestogo") {
             std::string value;
-            if (iss >> value && parse_int(value, movestogo))
+            if (iss >> value && parse_int(value, params.movestogo))
                 has_limit = true;
             else
                 return false;
         }
         else if (token == "infinite") {
-            limits.infinite = true;
+            params.infinite = true;
             has_limit = true;
         }
     }
@@ -519,94 +510,7 @@ void handle_setoption(
     if (!has_limit)
         return false;
 
-    if (depth > 0)
-        limits.depth = depth;
-
-    limits.node_limit = nodes;
-
-    if (movetime > 0) {
-        limits.soft_time_ms = movetime;
-        limits.hard_time_ms = movetime;
-        return true;
-    }
-
-    const int remaining = pos.side_to_move == WHITE ? wtime : btime;
-    const int increment = pos.side_to_move == WHITE ? winc : binc;
-
-    if (!limits.infinite && remaining > 0) {
-        const int move_number = std::max(1, pos.fullmove_number);
-        const bool sudden_death = movestogo == 0 && increment == 0;
-
-        // Early moves are kept intentionally cheaper, especially in sudden-death
-        // time controls, while later moves are allowed to spend more time.
-        int phase_scale = 100;
-        if (move_number <= 10)      phase_scale = sudden_death ? 50 : 60;
-        else if (move_number <= 20) phase_scale = sudden_death ? 65 : 75;
-        else if (move_number <= 35) phase_scale = sudden_death ? 80 : 90;
-        else if (move_number <= 50) phase_scale = sudden_death ? 100 : 105;
-        else                        phase_scale = sudden_death ? 115 : 120;
-
-        const int mtg =
-            movestogo > 0 ? movestogo :
-            sudden_death
-                ? (move_number <= 10 ? 36 :
-                   move_number <= 20 ? 30 :
-                   move_number <= 35 ? 24 : 18)
-                : 24;
-
-        const int reserve_div =
-            sudden_death
-                ? (move_number <= 10 ? 8 :
-                   move_number <= 20 ? 10 :
-                   move_number <= 35 ? 12 : 16)
-                : (phase_scale <= 75 ? 12 :
-                   phase_scale <= 90 ? 16 : 24);
-        const int reserve_cap =
-            sudden_death
-                ? std::max(50, remaining / 3)
-                : (phase_scale >= 105 ? 140 : 220);
-        const int reserve_floor = sudden_death ? 50 : 10;
-        const int reserve = std::clamp(remaining / reserve_div, reserve_floor, reserve_cap);
-        const int usable = std::max(1, remaining - reserve);
-
-        const int base = usable / std::max(1, mtg);
-        const int inc_share = (increment * (phase_scale + 20)) / 200;
-
-        int soft = (base * phase_scale) / 100 + inc_share;
-        soft += usable / std::max(sudden_death ? 160 : 96, mtg * (sudden_death ? 12 : 8));
-
-        const int soft_cap =
-            sudden_death
-                ? (phase_scale <= 65 ? usable / 6 :
-                   phase_scale <= 80 ? usable / 5 :
-                   usable / 4)
-                : (phase_scale <= 75 ? usable / 4 :
-                   phase_scale <= 90 ? usable / 3 :
-                   (usable * 2) / 5);
-        soft = std::max(1, std::min(soft, soft_cap));
-
-        int hard = std::min(
-            usable,
-            std::max(
-                soft + base * (sudden_death ? 1 : 2),
-                soft * (sudden_death ? 2 : (phase_scale >= 105 ? 3 : 2))
-            )
-        );
-        hard = std::max(soft, hard);
-
-        limits.soft_time_ms = soft;
-        limits.hard_time_ms = hard;
-    }
-
-    if (!limits.infinite &&
-        limits.depth == search::MAX_PLY &&
-        limits.node_limit == 0 &&
-        limits.soft_time_ms == 0 &&
-        limits.hard_time_ms == 0) {
-        return false;
-    }
-
-    return true;
+    return time_manager.build_limits(pos, params, limits);
 }
 
 [[nodiscard]] bool parse_perft_command(
@@ -685,6 +589,7 @@ int run_uci() {
     Position pos{};
     set_start_position(pos);
     position_refresh_key(pos, mem.tables);
+    timeman::TimeManager time_manager{};
     bool use_nnue = false;
     std::string eval_file = default_eval_file();
 
@@ -706,6 +611,7 @@ int run_uci() {
             memory::memory_clear_hash(mem);
             set_start_position(pos);
             position_refresh_key(pos, mem.tables);
+            time_manager.new_game();
         }
         else if (line.rfind("setoption", 0) == 0) {
             handle_setoption(mem, use_nnue, eval_file, std::cout, line);
@@ -716,7 +622,7 @@ int run_uci() {
         }
         else if (line.rfind("go", 0) == 0) {
             search::SearchLimits limits{};
-            if (!parse_go_command(pos, line, limits)) {
+            if (!parse_go_command(pos, time_manager, line, limits)) {
                 std::cout << "info string usage: " << go_usage_hint() << '\n';
                 std::cout << "info string " << go_usage_examples() << '\n';
                 continue;
@@ -728,8 +634,16 @@ int run_uci() {
             limits.use_nnue = use_nnue;
 
             std::cout << "info string eval " << active_eval_name(limits.use_nnue) << '\n';
+            const auto search_start = std::chrono::steady_clock::now();
             const search::SearchResult result =
                 search::iterative_deepening(pos, mem, limits, &std::cout);
+            const auto search_end = std::chrono::steady_clock::now();
+            const int elapsed_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    search_end - search_start
+                ).count()
+            );
+            time_manager.record_search(pos, limits, result, elapsed_ms);
 
             std::cout << "bestmove " << search::move_to_uci(result.best_move) << '\n';
         }

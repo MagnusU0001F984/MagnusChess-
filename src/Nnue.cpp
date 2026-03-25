@@ -30,140 +30,50 @@ SOFTWARE.
 #include <cmath>
 #include <cstdint>
 #include <fstream>
-#include <cstring>
-#include <limits>
-#include <sstream>
 #include <string>
-#include <vector>
-
-#include "Types.h"
 
 namespace valerain::nnue {
+
 namespace {
 
-/*
-This NNUE reader/evaluator implements a compact Stockfish-compatible small
-network path: load the transformer and bucket layers, build HalfKA features for
-both perspectives, then run the bucketed forward pass.
-*/
+using i16 = std::int16_t;
+using i32 = std::int32_t;
+using u32 = std::uint32_t;
 
-using std::int8_t;
-using std::int16_t;
-using std::int32_t;
-using std::uint8_t;
-using std::uint16_t;
-using std::uint32_t;
-using std::uint64_t;
+constexpr u32 kMagic   = 0x554E4E56u; // "VNNU" in little-endian file bytes
+constexpr u32 kVersion = 1;
 
-constexpr uint32_t kVersion = 0x7AF32F20u;
-constexpr int kOutputScale = 16;
-constexpr int kWeightScaleBits = 6;
+constexpr int kInputs = 768;   // 2 colors * 6 piece types * 64 squares
+constexpr int kHidden = 128;
+constexpr int kClip   = 255;
+constexpr int kDefaultScale = 400;
 
-constexpr int kTransformedDims = 128;
-constexpr int kFeatureDims = 22528;
-constexpr int kBuckets = 8;
-
-constexpr int kL2 = 15;                       // Stockfish L2Small
-constexpr int kL3 = 32;                       // Stockfish L3Small
-constexpr int kFc0LayerOutputs = kL2 + 1;     // 16, includes forward channel
-constexpr int kFc1LayerInputs = kL2 * 2;      // 30
-constexpr int kFc1PaddedInputs = 32;          // ceil_to_multiple(30, 32)
-constexpr int kFc2Inputs = kL3;               // 32
-
-constexpr const char kLebMagic[] = "COMPRESSED_LEB128";
-constexpr std::size_t kLebMagicSize = sizeof(kLebMagic) - 1;
-
-constexpr uint32_t affine_hash(uint32_t prev, uint32_t outdim) noexcept {
-    uint32_t h = 0xCC03DAE4u;
-    h += outdim;
-    h ^= prev >> 1;
-    h ^= prev << 31;
-    return h;
-}
-
-constexpr uint32_t relu_hash(uint32_t prev) noexcept {
-    return 0x538D24C7u + prev;
-}
-
-constexpr uint32_t transformer_hash() noexcept {
-    return 0x7f234cb8u ^ (kTransformedDims * 2u);
-}
-
-constexpr uint32_t bucket_arch_hash() noexcept {
-    uint32_t h = 0xEC42E90Du;
-    h ^= (kTransformedDims * 2u);
-    h = affine_hash(h, static_cast<uint32_t>(kFc0LayerOutputs)); // fc_0 : 16 outputs
-    h = relu_hash(h);                                            // ac_0 only, NOT ac_sqr_0
-    h = affine_hash(h, static_cast<uint32_t>(kL3));              // fc_1 : 32 outputs
-    h = relu_hash(h);                                            // ac_1
-    h = affine_hash(h, 1u);                                      // fc_2 : 1 output
-    return h;
-}
-
-constexpr uint32_t network_hash() noexcept {
-    return transformer_hash() ^ bucket_arch_hash();
-}
-
-constexpr int piece_channel(Color perspective, Piece pc) noexcept {
-    if (pc == PIECE_NONE) return 0;
-    const PieceType pt = type_of(pc);
-    if (pt == KING) return 10 * 64;
-    const int foe = (color_of(pc) == perspective) ? 0 : 1;
-    return (2 * static_cast<int>(pt) + foe) * 64;
-}
-
-constexpr std::array<int, 64> king_buckets = {
-    28 * 704, 29 * 704, 30 * 704, 31 * 704, 31 * 704, 30 * 704, 29 * 704, 28 * 704,
-    24 * 704, 25 * 704, 26 * 704, 27 * 704, 27 * 704, 26 * 704, 25 * 704, 24 * 704,
-    20 * 704, 21 * 704, 22 * 704, 23 * 704, 23 * 704, 22 * 704, 21 * 704, 20 * 704,
-    16 * 704, 17 * 704, 18 * 704, 19 * 704, 19 * 704, 18 * 704, 17 * 704, 16 * 704,
-    12 * 704, 13 * 704, 14 * 704, 15 * 704, 15 * 704, 14 * 704, 13 * 704, 12 * 704,
-     8 * 704,  9 * 704, 10 * 704, 11 * 704, 11 * 704, 10 * 704,  9 * 704,  8 * 704,
-     4 * 704,  5 * 704,  6 * 704,  7 * 704,  7 * 704,  6 * 704,  5 * 704,  4 * 704,
-     0 * 704,  1 * 704,  2 * 704,  3 * 704,  3 * 704,  2 * 704,  1 * 704,  0 * 704,
+struct FileHeader {
+    u32 magic;
+    u32 version;
+    u32 input_size;
+    u32 hidden_size;
+    i32 scale;
 };
 
-struct SmallBucket {
-    std::array<int32_t, kFc0LayerOutputs> fc0_bias{};
-    std::array<int8_t, std::size_t(kFc0LayerOutputs) * kFeatureDims /*placeholder, unused*/> dummy{};
-};
-
-struct BucketData {
-    std::array<int32_t, kFc0LayerOutputs> fc0_bias{};
-    std::array<int8_t, std::size_t(kFc0LayerOutputs) * kTransformedDims> fc0_weight{};
-
-    std::array<int32_t, kL3> fc1_bias{};
-    std::array<int8_t, std::size_t(kL3) * kFc1PaddedInputs> fc1_weight{};
-
-    std::array<int32_t, 1> fc2_bias{};
-    std::array<int8_t, kFc2Inputs> fc2_weight{};
-};
-
-struct SmallNetwork {
+struct NativeNetwork {
     bool is_loaded = false;
     std::string loaded_path;
     std::string desc;
     std::string error;
 
-    std::array<int16_t, kTransformedDims> ft_bias{};
-    std::vector<int16_t> ft_weight; // [feature][dim]
-    std::vector<int32_t> ft_psqt;   // [feature][bucket]
-    std::array<BucketData, kBuckets> buckets{};
+    i32 scale = kDefaultScale;
 
-    SmallNetwork()
-        : ft_weight(std::size_t(kFeatureDims) * kTransformedDims),
-          ft_psqt(std::size_t(kFeatureDims) * kBuckets) {}
+    // First layer: [input][hidden]
+    std::array<i16, kInputs * kHidden> w0{};
+    std::array<i16, kHidden> b0{};
+
+    // Output layer over dual-perspective hidden activations: [us_hidden | them_hidden]
+    std::array<i16, 2 * kHidden> w1{};
+    i32 b1 = 0;
 };
 
-SmallNetwork g_net;
-
-[[nodiscard]] inline int clampi(int x, int lo, int hi) noexcept {
-    return x < lo ? lo : (x > hi ? hi : x);
-}
-
-[[nodiscard]] inline Color opposite(Color c) noexcept {
-    return c == WHITE ? BLACK : WHITE;
-}
+NativeNetwork g_net{};
 
 template<typename T>
 [[nodiscard]] T read_le(std::istream& in) {
@@ -172,252 +82,107 @@ template<typename T>
     return value;
 }
 
-template<typename T>
-bool read_exact(std::istream& in, T* data, std::size_t count) {
-    in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(sizeof(T) * count));
-    return !!in;
+[[nodiscard]] inline Color opposite(Color c) noexcept {
+    return c == WHITE ? BLACK : WHITE;
 }
 
-template<std::size_t BlockSize, typename T, std::size_t OrderSize>
-void permute_blocks(T* data, std::size_t n, const std::array<std::size_t, OrderSize>& order) {
-    const std::size_t total_size = n * sizeof(T);
-    const std::size_t process_chunk = BlockSize * OrderSize;
-    if (total_size % process_chunk != 0)
-        return;
+[[nodiscard]] inline Square flip_vertical_sq(Square sq) noexcept {
+    return static_cast<Square>(static_cast<int>(sq) ^ 56);
+}
 
-    std::array<std::byte, 16 * 8> buffer{};
-    auto* bytes = reinterpret_cast<std::byte*>(data);
-    for (std::size_t off = 0; off < total_size; off += process_chunk) {
-        std::byte* values = bytes + off;
-        for (std::size_t j = 0; j < OrderSize; ++j) {
-            std::copy(values + order[j] * BlockSize,
-                      values + order[j] * BlockSize + BlockSize,
-                      buffer.data() + j * BlockSize);
-        }
-        std::copy(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(process_chunk), values);
+[[nodiscard]] inline Square orient_square(Square sq, Color persp) noexcept {
+    return persp == WHITE ? sq : flip_vertical_sq(sq);
+}
+
+// Maps PAWN..KING -> 0..5.
+// Adjust this switch if your engine uses different enum values.
+[[nodiscard]] inline int piece_plane(PieceType pt) noexcept {
+    switch (pt) {
+        case PAWN:   return 0;
+        case KNIGHT: return 1;
+        case BISHOP: return 2;
+        case ROOK:   return 3;
+        case QUEEN:  return 4;
+        case KING:   return 5;
+        default:     return -1;
     }
 }
 
-constexpr std::array<std::size_t, 8> packus_order() noexcept {
-#if defined(__AVX512F__)
-    return {0, 2, 4, 6, 1, 3, 5, 7};
-#elif defined(__AVX2__)
-    return {0, 2, 1, 3, 4, 6, 5, 7};
-#else
-    return {0, 1, 2, 3, 4, 5, 6, 7};
-#endif
+[[nodiscard]] inline int chess768_index(Color persp, Piece pc, Square sq) noexcept {
+    const PieceType pt = type_of(pc);
+    const int plane = piece_plane(pt);
+    if (plane < 0)
+        return -1;
+
+    const Color pc_color = color_of(pc);
+    const int color_plane = (pc_color == persp) ? 0 : 1;
+    const Square osq = orient_square(sq, persp);
+
+    return (color_plane * 6 + plane) * 64 + static_cast<int>(osq);
 }
 
-template<typename T>
-bool read_leb128_array(std::istream& in, T* out, std::size_t count) {
-    char magic[kLebMagicSize];
-    in.read(magic, static_cast<std::streamsize>(kLebMagicSize));
-    if (!in) return false;
-    if (std::memcmp(magic, kLebMagic, kLebMagicSize) != 0)
-        return false;
-
-    uint32_t bytes_left = read_le<uint32_t>(in);
-    if (!in) return false;
-
-    std::array<uint8_t, 8192> buf{};
-    uint32_t buf_pos = static_cast<uint32_t>(buf.size());
-
-    for (std::size_t i = 0; i < count; ++i) {
-        int32_t result = 0;
-        std::size_t shift = 0;
-        while (true) {
-            if (buf_pos == buf.size()) {
-                const std::size_t want = std::min<std::size_t>(bytes_left, buf.size());
-                in.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(want));
-                if (!in) return false;
-                buf_pos = 0;
-            }
-            uint8_t byte = buf[buf_pos++];
-            --bytes_left;
-            result |= static_cast<int32_t>(byte & 0x7f) << (shift % 32);
-            shift += 7;
-            if ((byte & 0x80) == 0) {
-                out[i] = static_cast<T>((shift >= 32 || (byte & 0x40) == 0)
-                                            ? result
-                                            : (result | ~((1u << shift) - 1)));
-                break;
-            }
-        }
-    }
-
-    if (bytes_left != 0) {
-        // keep the stream aligned exactly like Stockfish would expect
-        in.ignore(bytes_left);
-    }
-    return !!in;
+void clear_network() noexcept {
+    g_net.is_loaded = false;
+    g_net.loaded_path.clear();
+    g_net.desc.clear();
+    g_net.error.clear();
+    g_net.scale = kDefaultScale;
+    g_net.w0.fill(0);
+    g_net.b0.fill(0);
+    g_net.w1.fill(0);
+    g_net.b1 = 0;
 }
 
-bool read_header(std::istream& in, uint32_t expected_hash, std::string& desc, std::string& error) {
-    const uint32_t version = read_le<uint32_t>(in);
-    const uint32_t hash = read_le<uint32_t>(in);
-    const uint32_t size = read_le<uint32_t>(in);
-    if (!in) {
-        error = "failed to read NNUE header";
-        return false;
-    }
-    if (version != kVersion) {
-        error = "unexpected NNUE version";
-        return false;
-    }
-    if (hash != expected_hash) {
-        std::ostringstream oss;
-        oss << "network hash mismatch (got 0x" << std::hex << hash
-            << ", expected 0x" << expected_hash << ")";
-        error = oss.str();
-        return false;
-    }
-    desc.resize(size);
-    if (size)
-        in.read(desc.data(), static_cast<std::streamsize>(size));
-    return !!in;
-}
-
-[[nodiscard]] inline int make_halfka_index(Color perspective, Square sq, Piece pc, Square ksq) noexcept {
-    const int flip = (perspective == BLACK) ? 56 : 0;
-    const int orient = (file_of(ksq) < 4) ? 7 : 0;
-    return (sq ^ orient ^ flip) + piece_channel(perspective, pc) + king_buckets[ksq ^ flip];
-}
-
-void build_accumulator(const Position& pos, Color perspective, int bucket, int32_t* acc, int32_t& psqt) {
-    // Rebuild the transformed feature accumulator from scratch for one perspective.
-    const Square ksq = king_square(pos, perspective);
-    for (int i = 0; i < kTransformedDims; ++i)
-        acc[i] = g_net.ft_bias[i];
-    psqt = 0;
+void refresh_hidden(
+    const Position& pos,
+    Color persp,
+    i32* acc
+) noexcept {
+    for (int i = 0; i < kHidden; ++i)
+        acc[i] = g_net.b0[i];
 
     Bitboard bb = pieces(pos);
     while (bb) {
-        const Square sq = static_cast<Square>(std::countr_zero(static_cast<uint64_t>(bb)));
-        bb &= bb - 1;
+        const Square sq =
+            static_cast<Square>(std::countr_zero(static_cast<std::uint64_t>(bb)));
+        bb &= (bb - 1);
+
         const Piece pc = piece_on(pos, sq);
-        const int idx = make_halfka_index(perspective, sq, pc, ksq);
-        const std::size_t woff = std::size_t(idx) * kTransformedDims;
-        for (int i = 0; i < kTransformedDims; ++i)
-            acc[i] += g_net.ft_weight[woff + i];
-        psqt += g_net.ft_psqt[std::size_t(idx) * kBuckets + bucket];
+        const int idx = chess768_index(persp, pc, sq);
+        if (idx < 0)
+            continue;
+
+        const i16* w = &g_net.w0[static_cast<std::size_t>(idx) * kHidden];
+        for (int i = 0; i < kHidden; ++i)
+            acc[i] += w[i];
     }
 }
 
-void transform_features(const Position& pos, int bucket, uint8_t* out, int32_t& psqt_out) {
-    // Combine both perspectives and reorder the transformed features exactly as
-    // the small-network forward pass expects them.
-    alignas(64) int32_t acc[COLOR_NB][kTransformedDims];
-    int32_t psqt[COLOR_NB] = {0, 0};
-
-    build_accumulator(pos, WHITE, bucket, acc[WHITE], psqt[WHITE]);
-    build_accumulator(pos, BLACK, bucket, acc[BLACK], psqt[BLACK]);
+[[nodiscard]] int forward(const Position& pos) noexcept {
+    alignas(64) i32 us[kHidden];
+    alignas(64) i32 them[kHidden];
 
     const Color stm = static_cast<Color>(pos.side_to_move);
     const Color nstm = opposite(stm);
-    psqt_out = (psqt[stm] - psqt[nstm]) / 2;
 
-    const Color persp[2] = {stm, nstm};
-    for (int p = 0; p < 2; ++p) {
-        const int offset = p * (kTransformedDims / 2);
-        for (int j = 0; j < kTransformedDims / 2; ++j) {
-            const int a = clampi(acc[persp[p]][j], 0, 254);
-            const int b = clampi(acc[persp[p]][j + kTransformedDims / 2], 0, 254);
-            out[offset + j] = static_cast<uint8_t>((static_cast<long long>(a) * b) >> (2 * kWeightScaleBits + 7));
-        }
-    }
-}
+    refresh_hidden(pos, stm, us);
+    refresh_hidden(pos, nstm, them);
 
-int propagate_bucket(const BucketData& net, const uint8_t* tf) noexcept {
-    // Run the small fully connected network for the selected material bucket.
-    int32_t fc0[kFc0LayerOutputs];
-    for (int o = 0; o < kFc0LayerOutputs; ++o) {
-        int32_t sum = net.fc0_bias[o];
-        const auto* w = &net.fc0_weight[std::size_t(o) * kTransformedDims];
-        for (int i = 0; i < kTransformedDims; ++i)
-            sum += static_cast<int32_t>(w[i]) * static_cast<int32_t>(tf[i]);
-        fc0[o] = sum;
+    i32 sum = g_net.b1;
+    for (int i = 0; i < kHidden; ++i) {
+        const i32 a = std::clamp(us[i],   0, kClip);
+        const i32 b = std::clamp(them[i], 0, kClip);
+
+        sum += static_cast<i32>(g_net.w1[i]) * a;
+        sum += static_cast<i32>(g_net.w1[kHidden + i]) * b;
     }
 
-    uint8_t l1[kFc1PaddedInputs]{};
-    for (int i = 0; i < kL2; ++i) {
-        const int64_t x = fc0[i];
-        l1[i] = static_cast<uint8_t>(std::min<int64_t>(127, (x * x) >> (2 * kWeightScaleBits + 7)));
-        l1[kL2 + i] = static_cast<uint8_t>(clampi(fc0[i] >> kWeightScaleBits, 0, 127));
-    }
-
-    int32_t fc1[kL3];
-    for (int o = 0; o < kL3; ++o) {
-        int32_t sum = net.fc1_bias[o];
-        const auto* w = &net.fc1_weight[std::size_t(o) * kFc1PaddedInputs];
-        for (int i = 0; i < kFc1PaddedInputs; ++i)
-            sum += static_cast<int32_t>(w[i]) * static_cast<int32_t>(l1[i]);
-        fc1[o] = sum;
-    }
-
-    uint8_t l2[kFc2Inputs];
-    for (int i = 0; i < kFc2Inputs; ++i)
-        l2[i] = static_cast<uint8_t>(clampi(fc1[i] >> kWeightScaleBits, 0, 127));
-
-    int32_t out = net.fc2_bias[0];
-    for (int i = 0; i < kFc2Inputs; ++i)
-        out += static_cast<int32_t>(net.fc2_weight[i]) * static_cast<int32_t>(l2[i]);
-
-    const int32_t fwd = fc0[kL2] * (600 * kOutputScale) / (127 * (1 << kWeightScaleBits));
-    return out + fwd;
-}
-
-bool load_transformer(std::istream& in, std::string& error) {
-    const uint32_t section = read_le<uint32_t>(in);
-    if (!in || section != transformer_hash()) {
-        std::ostringstream oss;
-        oss << "feature transformer hash mismatch (got 0x" << std::hex << section
-            << ", expected 0x" << transformer_hash() << ")";
-        error = oss.str();
-        return false;
-    }
-
-    if (!read_leb128_array(in, g_net.ft_bias.data(), g_net.ft_bias.size()) ||
-        !read_leb128_array(in, g_net.ft_weight.data(), g_net.ft_weight.size()) ||
-        !read_leb128_array(in, g_net.ft_psqt.data(), g_net.ft_psqt.size())) {
-        error = "failed to read feature transformer parameters";
-        return false;
-    }
-
-    const auto order = packus_order();
-    permute_blocks<16>(g_net.ft_bias.data(), g_net.ft_bias.size(), order);
-    permute_blocks<16>(g_net.ft_weight.data(), g_net.ft_weight.size(), order);
-    for (auto& v : g_net.ft_bias) v = static_cast<int16_t>(v * 2);
-    for (auto& v : g_net.ft_weight) v = static_cast<int16_t>(v * 2);
-
-    return true;
-}
-
-bool load_bucket(std::istream& in, BucketData& b, std::string& error) {
-    const uint32_t section = read_le<uint32_t>(in);
-    if (!in || section != bucket_arch_hash()) {
-        std::ostringstream oss;
-        oss << "bucket architecture hash mismatch (got 0x" << std::hex << section
-            << ", expected 0x" << bucket_arch_hash() << ")";
-        error = oss.str();
-        return false;
-    }
-
-    if (!read_exact(in, b.fc0_bias.data(), b.fc0_bias.size()) ||
-        !read_exact(in, b.fc0_weight.data(), b.fc0_weight.size()) ||
-        !read_exact(in, b.fc1_bias.data(), b.fc1_bias.size()) ||
-        !read_exact(in, b.fc1_weight.data(), b.fc1_weight.size()) ||
-        !read_exact(in, b.fc2_bias.data(), b.fc2_bias.size()) ||
-        !read_exact(in, b.fc2_weight.data(), b.fc2_weight.size())) {
-        error = "failed to read bucket parameters";
-        return false;
-    }
-    return true;
+    return static_cast<int>(sum / std::max<i32>(1, g_net.scale));
 }
 
 } // namespace
 
 bool load(const std::string& path) {
-    // Loading fully resets the previous network state before parsing a new file.
     unload();
 
     std::ifstream in(path, std::ios::binary);
@@ -426,62 +191,83 @@ bool load(const std::string& path) {
         return false;
     }
 
-    if (!read_header(in, network_hash(), g_net.desc, g_net.error))
+    const FileHeader h{
+        .magic = read_le<u32>(in),
+        .version = read_le<u32>(in),
+        .input_size = read_le<u32>(in),
+        .hidden_size = read_le<u32>(in),
+        .scale = read_le<i32>(in)
+    };
+
+    if (!in) {
+        g_net.error = "failed to read NNUE header";
         return false;
-    if (!load_transformer(in, g_net.error))
+    }
+
+    if (h.magic != kMagic) {
+        g_net.error = "bad NNUE magic";
         return false;
-    for (auto& bucket : g_net.buckets)
-        if (!load_bucket(in, bucket, g_net.error))
-            return false;
+    }
+
+    if (h.version != kVersion) {
+        g_net.error = "unsupported NNUE version";
+        return false;
+    }
+
+    if (h.input_size != kInputs || h.hidden_size != kHidden) {
+        g_net.error = "network dimensions mismatch";
+        return false;
+    }
+
+    g_net.scale = h.scale > 0 ? h.scale : kDefaultScale;
+
+    in.read(reinterpret_cast<char*>(g_net.w0.data()), sizeof(g_net.w0));
+    in.read(reinterpret_cast<char*>(g_net.b0.data()), sizeof(g_net.b0));
+    in.read(reinterpret_cast<char*>(g_net.w1.data()), sizeof(g_net.w1));
+    in.read(reinterpret_cast<char*>(&g_net.b1), sizeof(g_net.b1));
+
+    if (!in) {
+        clear_network();
+        g_net.error = "truncated NNUE file";
+        return false;
+    }
 
     if (in.peek() != std::istream::traits_type::eof()) {
+        clear_network();
         g_net.error = "unexpected trailing data in NNUE file";
-        unload();
         return false;
     }
 
     g_net.is_loaded = true;
     g_net.loaded_path = path;
+    g_net.desc = "Valerain native NNUE v1 (Chess768 dual-perspective 128x1)";
     return true;
 }
 
 void unload() noexcept {
-    g_net.is_loaded = false;
-    g_net.loaded_path.clear();
-    g_net.desc.clear();
-    g_net.error.clear();
-    std::fill(g_net.ft_bias.begin(), g_net.ft_bias.end(), int16_t{0});
-    std::fill(g_net.ft_weight.begin(), g_net.ft_weight.end(), int16_t{0});
-    std::fill(g_net.ft_psqt.begin(), g_net.ft_psqt.end(), int32_t{0});
-    for (auto& b : g_net.buckets) {
-        std::fill(b.fc0_bias.begin(), b.fc0_bias.end(), int32_t{0});
-        std::fill(b.fc0_weight.begin(), b.fc0_weight.end(), int8_t{0});
-        std::fill(b.fc1_bias.begin(), b.fc1_bias.end(), int32_t{0});
-        std::fill(b.fc1_weight.begin(), b.fc1_weight.end(), int8_t{0});
-        std::fill(b.fc2_bias.begin(), b.fc2_bias.end(), int32_t{0});
-        std::fill(b.fc2_weight.begin(), b.fc2_weight.end(), int8_t{0});
-    }
+    clear_network();
 }
 
-bool loaded() noexcept { return g_net.is_loaded; }
-const std::string& path() noexcept { return g_net.loaded_path; }
-const std::string& description() noexcept { return g_net.desc; }
-const std::string& last_error() noexcept { return g_net.error; }
+bool loaded() noexcept {
+    return g_net.is_loaded;
+}
+
+const std::string& path() noexcept {
+    return g_net.loaded_path;
+}
+
+const std::string& description() noexcept {
+    return g_net.desc;
+}
+
+const std::string& last_error() noexcept {
+    return g_net.error;
+}
 
 int eval(const Position& pos) noexcept {
     if (!g_net.is_loaded)
         return 0;
-
-    // Piece count selects the bucket; the final output is blended with the
-    // PSQT term and rescaled back to the network's native unit.
-    const int piece_count = std::popcount(static_cast<uint64_t>(pieces(pos)));
-    const int bucket = clampi((piece_count - 1) / 4, 0, kBuckets - 1);
-
-    alignas(64) uint8_t transformed[kTransformedDims]{};
-    int32_t psqt = 0;
-    transform_features(pos, bucket, transformed, psqt);
-    const int32_t positional = propagate_bucket(g_net.buckets[bucket], transformed);
-    return static_cast<int>((psqt + positional) / kOutputScale);
+    return forward(pos);
 }
 
 WinRateParams win_rate_params(const Position& pos) noexcept {
@@ -504,15 +290,24 @@ WinRateParams win_rate_params(const Position& pos) noexcept {
 }
 
 int to_cp(int v, const Position& pos) noexcept {
-    // Convert NNUE's native value into centipawns using the fitted win-rate model.
     auto [a, b] = win_rate_params(pos);
     (void)b;
+
+    if (std::abs(a) < 1e-9)
+        return v;
+
     return static_cast<int>(std::round(100.0 * static_cast<double>(v) / a));
 }
 
 int win_rate_model(int v, const Position& pos) noexcept {
     auto [a, b] = win_rate_params(pos);
-    return static_cast<int>(0.5 + 1000.0 / (1.0 + std::exp((a - static_cast<double>(v)) / b)));
+
+    if (std::abs(b) < 1e-9)
+        return v >= static_cast<int>(a) ? 1000 : 0;
+
+    return static_cast<int>(
+        0.5 + 1000.0 / (1.0 + std::exp((a - static_cast<double>(v)) / b))
+    );
 }
 
 } // namespace valerain::nnue

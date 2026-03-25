@@ -56,6 +56,16 @@ struct Position {
     int board[SQ_NB];
 };
 
+struct StateInfo {
+    int castling_rights = 0;
+    Square ep_sq = NO_SQ;
+    int halfmove_clock = 0;
+    int fullmove_number = 1;
+    Key key = 0ULL;
+    Piece captured = PIECE_NONE;
+    Square captured_sq = NO_SQ;
+};
+
 // Convenience accessors used throughout the engine.
 inline int us(const Position& pos) noexcept {
     return pos.side_to_move;
@@ -142,8 +152,22 @@ void position_move_piece(
 bool position_has_valid_kings(const Position& pos) noexcept;
 bool position_board_matches_bitboards(const Position& pos) noexcept;
 
-// Copy-make helpers used by perft and search. The overload with Tables keeps
-// the incremental Zobrist key up to date as well.
+void make_move(
+    Position& pos,
+    Move m,
+    const Tables& tables,
+    StateInfo& st
+) noexcept;
+
+void unmake_move(
+    Position& pos,
+    Move m,
+    const Tables& tables,
+    const StateInfo& st
+) noexcept;
+
+// Copy-make helpers used by perft and legality validation paths. The overload
+// with Tables keeps the incremental Zobrist key up to date as well.
 void do_move_copy(Position& pos, Move m) noexcept;
 void do_move_copy(Position& pos, Move m, const Tables& tables) noexcept;
 

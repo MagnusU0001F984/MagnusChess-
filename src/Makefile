@@ -16,6 +16,7 @@ SRC := \
 	Perft.cpp \
 	Position.cpp \
 	Search.cpp \
+	Time.cpp \
 	TT.cpp \
 	Uci.cpp
 

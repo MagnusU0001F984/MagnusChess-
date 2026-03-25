@@ -495,11 +495,12 @@ struct Searcher {
                     continue;
             }
 
-            Position next = pos;
-            do_move_copy(next, move, mem.tables);
-            memory::tt_prefetch(mem.tt, next.key);
+            StateInfo st{};
+            make_move(pos, move, mem.tables, st);
+            memory::tt_prefetch(mem.tt, pos.key);
 
-            const int score = -qsearch(next, -beta, -alpha, ply + 1);
+            const int score = -qsearch(pos, -beta, -alpha, ply + 1);
+            unmake_move(pos, move, mem.tables, st);
             if (score > alpha) {
                 alpha = score;
                 best_move = move;
@@ -675,13 +676,13 @@ struct Searcher {
                 continue;
             }
 
-            Position next = pos;
-            do_move_copy(next, move, mem.tables);
-            memory::tt_prefetch(mem.tt, next.key);
+            StateInfo st{};
+            make_move(pos, move, mem.tables, st);
+            memory::tt_prefetch(mem.tt, pos.key);
 
             int score = 0;
             if (!searched_first) {
-                score = -pvs(next, depth - 1, -beta, -alpha, ply + 1, true);
+                score = -pvs(pos, depth - 1, -beta, -alpha, ply + 1, true);
                 searched_first = true;
             } else {
                 if (!pv_node &&
@@ -692,7 +693,7 @@ struct Searcher {
                     // Late Move Reductions search late quiets at a reduced depth first.
                     const int reduction = lmr_reduction(depth, i);
                     score = -pvs(
-                        next,
+                        pos,
                         depth - 1 - reduction,
                         -alpha - 1,
                         -alpha,
@@ -703,16 +704,18 @@ struct Searcher {
                     if (score > alpha)
                         // If the reduced search still looks interesting, restore
                         // the original depth and test it again on a narrow window.
-                        score = -pvs(next, depth - 1, -alpha - 1, -alpha, ply + 1, true);
+                        score = -pvs(pos, depth - 1, -alpha - 1, -alpha, ply + 1, true);
                 } else {
-                    score = -pvs(next, depth - 1, -alpha - 1, -alpha, ply + 1, true);
+                    score = -pvs(pos, depth - 1, -alpha - 1, -alpha, ply + 1, true);
                 }
 
                 if (score > alpha && score < beta)
                     // A null-window fail-high inside the PV must be confirmed by
                     // a full-window re-search before the score is trusted.
-                    score = -pvs(next, depth - 1, -beta, -alpha, ply + 1, true);
+                    score = -pvs(pos, depth - 1, -beta, -alpha, ply + 1, true);
             }
+
+            unmake_move(pos, move, mem.tables, st);
 
             if (quiet_move)
                 searched_quiets[searched_quiet_count++] = move;
@@ -776,18 +779,20 @@ struct Searcher {
                 break;
 
             const Move move = pick_next(scored, i);
-            Position next = root;
-            do_move_copy(next, move, mem.tables);
-            memory::tt_prefetch(mem.tt, next.key);
+            StateInfo st{};
+            make_move(root, move, mem.tables, st);
+            memory::tt_prefetch(mem.tt, root.key);
 
             int score = 0;
             if (i == 0) {
-                score = -pvs(next, depth - 1, -beta, -alpha, 1, true);
+                score = -pvs(root, depth - 1, -beta, -alpha, 1, true);
             } else {
-                score = -pvs(next, depth - 1, -alpha - 1, -alpha, 1, true);
+                score = -pvs(root, depth - 1, -alpha - 1, -alpha, 1, true);
                 if (score > alpha)
-                    score = -pvs(next, depth - 1, -beta, -alpha, 1, true);
+                    score = -pvs(root, depth - 1, -beta, -alpha, 1, true);
             }
+
+            unmake_move(root, move, mem.tables, st);
 
             if (score > best_score) {
                 best_score = score;

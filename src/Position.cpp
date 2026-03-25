@@ -294,6 +294,186 @@ bool position_board_matches_bitboards(const Position& pos) noexcept {
            (pos.color_bb[WHITE] | pos.color_bb[BLACK]) == pos.occupied;
 }
 
+void make_move(
+    Position& pos,
+    Move m,
+    const Tables& tables,
+    StateInfo& st
+) noexcept {
+    st.castling_rights = pos.castling_rights;
+    st.ep_sq = pos.ep_sq;
+    st.halfmove_clock = pos.halfmove_clock;
+    st.fullmove_number = pos.fullmove_number;
+    st.key = pos.key;
+    st.captured = PIECE_NONE;
+    st.captured_sq = NO_SQ;
+
+    const Color us = static_cast<Color>(pos.side_to_move);
+    const Color them = static_cast<Color>(us ^ 1);
+
+    const Square from = from_sq(m);
+    const Square to   = to_sq(m);
+    const u16 flag    = move_flag(m);
+
+    const Piece moving = piece_on(pos, from);
+    const PieceType pt = type_of(moving);
+
+    if (pt == PAWN || move_is_capture(m) || move_is_ep(m))
+        pos.halfmove_clock = 0;
+    else
+        ++pos.halfmove_clock;
+
+    if (us == BLACK)
+        ++pos.fullmove_number;
+
+    key_xor_castling(pos, tables);
+    key_xor_ep(pos, tables);
+
+    pos.ep_sq = NO_SQ;
+
+    clear_castling_rights_by_square(pos, from);
+    clear_castling_rights_by_square(pos, to);
+
+    if (pt == KING) {
+        if (us == WHITE) pos.castling_rights &= ~(WHITE_OO | WHITE_OOO);
+        else             pos.castling_rights &= ~(BLACK_OO | BLACK_OOO);
+    }
+
+    if (flag == MOVE_OO) {
+        if (us == WHITE) {
+            move_piece_with_key(pos, tables, WHITE, KING, 4, 6);
+            move_piece_with_key(pos, tables, WHITE, ROOK, 7, 5);
+        } else {
+            move_piece_with_key(pos, tables, BLACK, KING, 60, 62);
+            move_piece_with_key(pos, tables, BLACK, ROOK, 63, 61);
+        }
+    }
+    else if (flag == MOVE_OOO) {
+        if (us == WHITE) {
+            move_piece_with_key(pos, tables, WHITE, KING, 4, 2);
+            move_piece_with_key(pos, tables, WHITE, ROOK, 0, 3);
+        } else {
+            move_piece_with_key(pos, tables, BLACK, KING, 60, 58);
+            move_piece_with_key(pos, tables, BLACK, ROOK, 56, 59);
+        }
+    }
+    else if (flag == MOVE_EP) {
+        const Square cap_sq = (us == WHITE) ? (to - 8) : (to + 8);
+        st.captured_sq = cap_sq;
+        st.captured = piece_on(pos, cap_sq);
+        remove_piece_at(pos, tables, cap_sq);
+        move_piece_with_key(pos, tables, us, PAWN, from, to);
+    }
+    else if (move_is_promotion(m)) {
+        if (move_is_capture(m)) {
+            st.captured_sq = to;
+            st.captured = piece_on(pos, to);
+            remove_piece_at(pos, tables, to);
+        }
+
+        key_xor_piece(pos, tables, us, PAWN, from);
+        position_remove_piece(pos, us, PAWN, from);
+        put_piece_with_key(pos, tables, us, promo_piece(m), to);
+    }
+    else {
+        if (move_is_capture(m)) {
+            st.captured_sq = to;
+            st.captured = piece_on(pos, to);
+            remove_piece_at(pos, tables, to);
+        }
+
+        move_piece_with_key(pos, tables, us, pt, from, to);
+
+        if (flag == MOVE_DOUBLE_PUSH)
+            pos.ep_sq = (us == WHITE) ? (from + 8) : (from - 8);
+    }
+
+    pos.side_to_move = them;
+
+    key_xor_castling(pos, tables);
+    key_xor_ep(pos, tables);
+    pos.key ^= tables.zobrist.side;
+}
+
+void unmake_move(
+    Position& pos,
+    Move m,
+    const Tables& tables,
+    const StateInfo& st
+) noexcept {
+    const Color them = static_cast<Color>(pos.side_to_move);
+    const Color us = static_cast<Color>(them ^ 1);
+
+    const Square from = from_sq(m);
+    const Square to   = to_sq(m);
+    const u16 flag    = move_flag(m);
+
+    if (flag == MOVE_OO) {
+        if (us == WHITE) {
+            position_move_piece(pos, WHITE, KING, 6, 4);
+            position_move_piece(pos, WHITE, ROOK, 5, 7);
+        } else {
+            position_move_piece(pos, BLACK, KING, 62, 60);
+            position_move_piece(pos, BLACK, ROOK, 61, 63);
+        }
+    }
+    else if (flag == MOVE_OOO) {
+        if (us == WHITE) {
+            position_move_piece(pos, WHITE, KING, 2, 4);
+            position_move_piece(pos, WHITE, ROOK, 3, 0);
+        } else {
+            position_move_piece(pos, BLACK, KING, 58, 60);
+            position_move_piece(pos, BLACK, ROOK, 59, 56);
+        }
+    }
+    else if (flag == MOVE_EP) {
+        position_move_piece(pos, us, PAWN, to, from);
+
+        if (st.captured != PIECE_NONE && st.captured_sq != NO_SQ) {
+            position_put_piece(
+                pos,
+                color_of(st.captured),
+                type_of(st.captured),
+                st.captured_sq
+            );
+        }
+    }
+    else if (move_is_promotion(m)) {
+        const PieceType promo = promo_piece(m);
+        position_remove_piece(pos, us, promo, to);
+        position_put_piece(pos, us, PAWN, from);
+
+        if (st.captured != PIECE_NONE && st.captured_sq == to) {
+            position_put_piece(
+                pos,
+                color_of(st.captured),
+                type_of(st.captured),
+                to
+            );
+        }
+    }
+    else {
+        const PieceType pt = piece_type_on(pos, to);
+        position_move_piece(pos, us, pt, to, from);
+
+        if (st.captured != PIECE_NONE && st.captured_sq == to) {
+            position_put_piece(
+                pos,
+                color_of(st.captured),
+                type_of(st.captured),
+                to
+            );
+        }
+    }
+
+    pos.side_to_move = us;
+    pos.castling_rights = st.castling_rights;
+    pos.ep_sq = st.ep_sq;
+    pos.halfmove_clock = st.halfmove_clock;
+    pos.fullmove_number = st.fullmove_number;
+    pos.key = st.key;
+}
+
 void do_move_copy(Position& pos, Move m) noexcept {
     // Plain copy-make used by perft and validation paths that do not need the
     // incremental Zobrist key.
@@ -369,85 +549,9 @@ void do_move_copy(Position& pos, Move m) noexcept {
 }
 
 void do_move_copy(Position& pos, Move m, const Tables& tables) noexcept {
-    // Search uses this overload so copy-make updates board state, incremental
-    // eval, and the Zobrist key in one pass.
-    const Color us = static_cast<Color>(pos.side_to_move);
-    const Color them = static_cast<Color>(us ^ 1);
-
-    const Square from = from_sq(m);
-    const Square to   = to_sq(m);
-    const u16 flag    = move_flag(m);
-
-    const Piece moving = piece_on(pos, from);
-    const PieceType pt = type_of(moving);
-
-    if (pt == PAWN || move_is_capture(m) || move_is_ep(m))
-        pos.halfmove_clock = 0;
-    else
-        ++pos.halfmove_clock;
-
-    if (us == BLACK)
-        ++pos.fullmove_number;
-
-    key_xor_castling(pos, tables);
-    key_xor_ep(pos, tables);
-
-    pos.ep_sq = NO_SQ;
-
-    clear_castling_rights_by_square(pos, from);
-    clear_castling_rights_by_square(pos, to);
-
-    if (pt == KING) {
-        if (us == WHITE) pos.castling_rights &= ~(WHITE_OO | WHITE_OOO);
-        else             pos.castling_rights &= ~(BLACK_OO | BLACK_OOO);
-    }
-
-    if (flag == MOVE_OO) {
-        if (us == WHITE) {
-            move_piece_with_key(pos, tables, WHITE, KING, 4, 6);
-            move_piece_with_key(pos, tables, WHITE, ROOK, 7, 5);
-        } else {
-            move_piece_with_key(pos, tables, BLACK, KING, 60, 62);
-            move_piece_with_key(pos, tables, BLACK, ROOK, 63, 61);
-        }
-    }
-    else if (flag == MOVE_OOO) {
-        if (us == WHITE) {
-            move_piece_with_key(pos, tables, WHITE, KING, 4, 2);
-            move_piece_with_key(pos, tables, WHITE, ROOK, 0, 3);
-        } else {
-            move_piece_with_key(pos, tables, BLACK, KING, 60, 58);
-            move_piece_with_key(pos, tables, BLACK, ROOK, 56, 59);
-        }
-    }
-    else if (flag == MOVE_EP) {
-        const Square cap_sq = (us == WHITE) ? (to - 8) : (to + 8);
-        remove_piece_at(pos, tables, cap_sq);
-        move_piece_with_key(pos, tables, us, PAWN, from, to);
-    }
-    else if (move_is_promotion(m)) {
-        if (move_is_capture(m))
-            remove_piece_at(pos, tables, to);
-
-        key_xor_piece(pos, tables, us, PAWN, from);
-        position_remove_piece(pos, us, PAWN, from);
-        put_piece_with_key(pos, tables, us, promo_piece(m), to);
-    }
-    else {
-        if (move_is_capture(m))
-            remove_piece_at(pos, tables, to);
-
-        move_piece_with_key(pos, tables, us, pt, from, to);
-
-        if (flag == MOVE_DOUBLE_PUSH)
-            pos.ep_sq = (us == WHITE) ? (from + 8) : (from - 8);
-    }
-
-    pos.side_to_move = them;
-
-    key_xor_castling(pos, tables);
-    key_xor_ep(pos, tables);
-    pos.key ^= tables.zobrist.side;
+    // Kept for copy-make call sites that still require keyed updates.
+    StateInfo st{};
+    make_move(pos, m, tables, st);
 }
 
 } // namespace valerain
