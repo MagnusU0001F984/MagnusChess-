@@ -10,12 +10,14 @@ SRC := \
 	Attack.cpp \
 	Bench.cpp \
 	Evaluation.cpp \
+	History.cpp \
 	Main.cpp \
 	MoveGen.cpp \
 	Nnue.cpp \
 	Perft.cpp \
 	Position.cpp \
 	Search.cpp \
+	See.cpp \
 	Time.cpp \
 	TT.cpp \
 	Uci.cpp

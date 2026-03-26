@@ -25,15 +25,15 @@ SOFTWARE.
 #include "Search.h"
 
 #include <algorithm>
-#include <bit>
 #include <chrono>
 #include <cstring>
 #include <iostream>
 
-#include "Attack.h"
 #include "Evaluation.h"
+#include "History.h"
 #include "MoveGen.h"
 #include "Nnue.h"
+#include "See.h"
 
 /*
 This file implements a compact classical search:
@@ -64,10 +64,6 @@ constexpr int piece_order_value[PIECE_TYPE_NB] = {
     100, 320, 330, 500, 900, 0
 };
 
-constexpr int see_piece_value[PIECE_TYPE_NB] = {
-    100, 320, 330, 500, 900, 20000
-};
-
 /*
 Searcher owns the mutable state for one iterative-deepening session: node
 counting, killer/history tables, PV storage, and stop-condition bookkeeping.
@@ -80,8 +76,7 @@ struct Searcher {
 
     u64 nodes = 0;
     u64 base_nodes = 0;
-    Move killers[MAX_PLY][2]{};
-    i32 history[COLOR_NB][PIECE_TYPE_NB][SQ_NB]{};
+    HistoryTable history_tables{};
     Move pv_table[MAX_PLY][MAX_PLY]{};
     int pv_length[MAX_PLY + 1]{};
     Key rep_keys[MAX_PLY + 1]{};
@@ -255,127 +250,6 @@ struct Searcher {
         return static_eval > 0 ? REPETITION_AVOID_SCORE : 0;
     }
 
-    [[nodiscard]] bool see_ge(
-        const Position& pos,
-        Move move,
-        int threshold
-    ) const noexcept {
-        if (!move_is_capture(move))
-            return threshold <= 0;
-
-        const Color us = static_cast<Color>(pos.side_to_move);
-        const Square from = from_sq(move);
-        const Square to = to_sq(move);
-        const PieceType moving = piece_type_on(pos, from);
-        if (!is_ok(moving))
-            return false;
-
-        const PieceType captured = move_is_ep(move)
-            ? PAWN
-            : piece_type_on(pos, to);
-        if (!is_ok(captured))
-            return false;
-
-        int balance = see_piece_value[captured] - threshold;
-        PieceType next_victim = moving;
-
-        if (move_is_promotion(move)) {
-            const PieceType promo = promo_piece(move);
-            if (!is_ok(promo))
-                return false;
-            balance += see_piece_value[promo] - see_piece_value[PAWN];
-            next_victim = promo;
-        }
-
-        if (balance < 0)
-            return false;
-
-        balance -= see_piece_value[next_victim];
-        if (balance >= 0)
-            return true;
-
-        Bitboard occupied = pos.occupied ^ bb_of(from);
-        if (move_is_ep(move)) {
-            const Square cap_sq = (us == WHITE) ? (to - 8) : (to + 8);
-            occupied ^= bb_of(cap_sq);
-        } else {
-            occupied ^= bb_of(to);
-        }
-
-        const Bitboard bishop_like = pos.piece_bb[BISHOP] | pos.piece_bb[QUEEN];
-        const Bitboard rook_like = pos.piece_bb[ROOK] | pos.piece_bb[QUEEN];
-        Bitboard attackers = attackers_to(pos, mem, to, occupied);
-
-        Color side = static_cast<Color>(us ^ 1);
-        while (true) {
-            attackers &= occupied;
-            const Bitboard side_attackers = attackers & pos.color_bb[side];
-            if (side_attackers == 0ULL)
-                break;
-
-            PieceType attacker = PIECE_TYPE_NONE;
-            Bitboard from_set = 0ULL;
-
-            Bitboard by_pt = side_attackers & pos.piece_bb[PAWN];
-            if (by_pt) {
-                attacker = PAWN;
-                from_set = bb_of(static_cast<Square>(std::countr_zero(by_pt)));
-            } else {
-                by_pt = side_attackers & pos.piece_bb[KNIGHT];
-                if (by_pt) {
-                    attacker = KNIGHT;
-                    from_set = bb_of(static_cast<Square>(std::countr_zero(by_pt)));
-                } else {
-                    by_pt = side_attackers & pos.piece_bb[BISHOP];
-                    if (by_pt) {
-                        attacker = BISHOP;
-                        from_set = bb_of(static_cast<Square>(std::countr_zero(by_pt)));
-                    } else {
-                        by_pt = side_attackers & pos.piece_bb[ROOK];
-                        if (by_pt) {
-                            attacker = ROOK;
-                            from_set = bb_of(static_cast<Square>(std::countr_zero(by_pt)));
-                        } else {
-                            by_pt = side_attackers & pos.piece_bb[QUEEN];
-                            if (by_pt) {
-                                attacker = QUEEN;
-                                from_set = bb_of(static_cast<Square>(std::countr_zero(by_pt)));
-                            } else {
-                                by_pt = side_attackers & pos.piece_bb[KING];
-                                if (by_pt) {
-                                    attacker = KING;
-                                    from_set = bb_of(static_cast<Square>(std::countr_zero(by_pt)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (attacker == PIECE_TYPE_NONE)
-                break;
-
-            occupied ^= from_set;
-
-            if (attacker == PAWN || attacker == BISHOP || attacker == QUEEN)
-                attackers |= bishop_attacks(mem, to, occupied) & bishop_like;
-            if (attacker == ROOK || attacker == QUEEN)
-                attackers |= rook_attacks(mem, to, occupied) & rook_like;
-
-            attackers &= occupied;
-            balance = see_piece_value[attacker] - balance;
-            side = static_cast<Color>(side ^ 1);
-
-            if (balance >= 0) {
-                if (attacker == KING && (attackers & pos.color_bb[side]) != 0ULL)
-                    side = static_cast<Color>(side ^ 1);
-                break;
-            }
-        }
-
-        return side != us;
-    }
-
     [[nodiscard]] bool has_non_pawn_material(
         const Position& pos,
         Color side
@@ -469,62 +343,6 @@ struct Searcher {
         pv_length[ply] = child_len + 1;
     }
 
-    inline void bonus_history(const Position& pos, Move move, int depth) noexcept {
-        // History only tracks quiet moves; captures are already ordered by MVV-LVA.
-        if (move_is_capture(move))
-            return;
-
-        const Color side = static_cast<Color>(pos.side_to_move);
-        const PieceType pt = piece_type_on(pos, from_sq(move));
-        if (!is_ok(pt))
-            return;
-
-        i32& h = history[side][pt][to_sq(move)];
-        h += depth * depth;
-        if (h > 32767)
-            h = 32767;
-    }
-
-    inline void penalty_history(const Position& pos, Move move, int depth) noexcept {
-        if (move_is_capture(move))
-            return;
-
-        const Color side = static_cast<Color>(pos.side_to_move);
-        const PieceType pt = piece_type_on(pos, from_sq(move));
-        if (!is_ok(pt))
-            return;
-
-        i32& h = history[side][pt][to_sq(move)];
-        h -= depth * depth * 4;
-        if (h < -32767)
-            h = -32767;
-    }
-
-    inline void penalize_quiets(
-        const Position& pos,
-        const Move* quiets,
-        int count,
-        Move excluded_move,
-        int depth
-    ) noexcept {
-        for (int i = 0; i < count; ++i)
-            if (quiets[i] != excluded_move)
-                penalty_history(pos, quiets[i], depth);
-    }
-
-    inline void reward_history(const Position& pos, Move move, int depth, int ply) noexcept {
-        // A quiet beta cutoff is a classic killer/history success signal.
-        if (move_is_capture(move))
-            return;
-
-        if (killers[ply][0] != move) {
-            killers[ply][1] = killers[ply][0];
-            killers[ply][0] = move;
-        }
-
-        bonus_history(pos, move, depth);
-    }
-
     [[nodiscard]] inline i32 score_move(
         const Position& pos,
         Move move,
@@ -551,14 +369,12 @@ struct Searcher {
         if (move_is_promotion(move))
             return 19'000'000 + piece_order_value[promo_piece(move)];
 
-        if (move == killers[ply][0])
+        if (move == history_tables.killer(ply, 0))
             return 18'000'000;
-        if (move == killers[ply][1])
+        if (move == history_tables.killer(ply, 1))
             return 17'999'000;
 
-        const Color side = static_cast<Color>(pos.side_to_move);
-        const PieceType pt = piece_type_on(pos, from_sq(move));
-        return is_ok(pt) ? history[side][pt][to_sq(move)] : 0;
+        return history_tables.quiet_value(pos, move);
     }
 
     inline void score_moves(
@@ -659,7 +475,7 @@ struct Searcher {
 
             if (!checked &&
                 !move_is_promotion(move) &&
-                !see_ge(pos, move, -DELTA_MARGIN)) {
+                !search::see_ge(pos, mem, move, -DELTA_MARGIN)) {
                 continue;
             }
 
@@ -836,7 +652,7 @@ struct Searcher {
                 move_is_capture(move) &&
                 !move_is_promotion(move);
             const int history_score = quiet_move
-                ? history[side][piece_type_on(pos, from_sq(move))][to_sq(move)]
+                ? history_tables.quiet_value(pos, move)
                 : 0;
 
             if (quiet_move)
@@ -847,7 +663,7 @@ struct Searcher {
                 search_depth <= SEE_PRUNE_DEPTH_LIMIT &&
                 simple_capture &&
                 i > 1 &&
-                !see_ge(pos, move, -60 * search_depth)) {
+                !search::see_ge(pos, mem, move, -60 * search_depth)) {
                 // Bad capture pruning: skip late captures that fail a SEE threshold.
                 continue;
             }
@@ -931,8 +747,8 @@ struct Searcher {
                 best_move = move;
                 update_pv(ply, move);
                 if (alpha >= beta) {
-                    reward_history(pos, move, depth, ply);
-                    penalize_quiets(pos, searched_quiets, searched_quiet_count, move, depth);
+                    history_tables.reward_cutoff(pos, move, depth, ply);
+                    history_tables.penalize_quiets(pos, searched_quiets, searched_quiet_count, move, depth);
                     cutoff = true;
                     break;
                 }
@@ -949,8 +765,8 @@ struct Searcher {
             alpha > alpha0 &&
             best_move != 0 &&
             !move_is_capture(best_move)) {
-            bonus_history(pos, best_move, std::max(1, search_depth - 1));
-            penalize_quiets(pos, searched_quiets, searched_quiet_count, best_move, std::max(1, search_depth - 1));
+            history_tables.bonus(pos, best_move, std::max(1, search_depth - 1));
+            history_tables.penalize_quiets(pos, searched_quiets, searched_quiet_count, best_move, std::max(1, search_depth - 1));
         }
 
         save_tt(pos, search_depth, ply, alpha, static_eval, best_move, alpha0, beta, pv_node);
