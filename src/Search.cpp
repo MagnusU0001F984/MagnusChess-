@@ -174,6 +174,13 @@ struct Searcher {
         if (stopped)
             return true;
 
+        if (limits.stop != nullptr &&
+            limits.stop->load(std::memory_order_relaxed)) {
+            stopped = true;
+            hard_stop = true;
+            return true;
+        }
+
         if (limits.node_limit > 0 && global_nodes() >= limits.node_limit) {
             stopped = true;
             hard_stop = true;
@@ -968,6 +975,23 @@ struct Searcher {
         Move* rend = generate_pseudo_legal(root, mem, info, list.moves);
         list.size = static_cast<int>(rend - list.moves);
 
+        if (limits.root_move_count > 0) {
+            MoveList filtered{};
+            for (int i = 0; i < list.size; ++i) {
+                const Move move = list.moves[i];
+                bool allowed = false;
+                for (int j = 0; j < limits.root_move_count; ++j) {
+                    if (limits.root_moves[j] == move) {
+                        allowed = true;
+                        break;
+                    }
+                }
+                if (allowed)
+                    filtered.moves[filtered.size++] = move;
+            }
+            list = filtered;
+        }
+
         const memory::TTProbe probe = memory::tt_probe(mem.tt, root.key);
         const Move tt_move = tt_move_from_probe(probe);
         const Move root_hint = move_is_none(tt_move) ? hint_move : tt_move;
@@ -1127,6 +1151,7 @@ SearchResult iterative_deepening(
 
         const auto end = Searcher::clock::now();
         total_nodes += depth_nodes;
+        const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
 
         if (!searcher.stopped || best.depth == 0) {
             best = current;
@@ -1134,7 +1159,7 @@ SearchResult iterative_deepening(
             hint_move = current.best_move;
         }
 
-        if (out) {
+        if (out && !stopped_mid_depth) {
             const double seconds =
                 std::chrono::duration<double>(end - search_start).count();
             const u64 nps = seconds > 0.0
@@ -1154,6 +1179,9 @@ SearchResult iterative_deepening(
 
             *out << '\n';
         }
+
+        if (stopped_mid_depth)
+            break;
 
         if (searcher.stop_after_completed_depth())
             break;

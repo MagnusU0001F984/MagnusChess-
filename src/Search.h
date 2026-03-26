@@ -24,6 +24,7 @@ SOFTWARE.
 
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <iosfwd>
 #include <string>
@@ -50,6 +51,9 @@ struct SearchLimits {
     int hard_time_ms = 0;
     bool infinite = false;
     bool use_nnue = false;
+    Move root_moves[256]{};
+    int root_move_count = 0;
+    const std::atomic<bool>* stop = nullptr;
 };
 
 struct SearchResult {

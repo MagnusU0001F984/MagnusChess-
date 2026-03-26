@@ -25,6 +25,7 @@ SOFTWARE.
 #include "Uci.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <charconv>
 #include <cctype>
@@ -34,9 +35,11 @@ SOFTWARE.
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 
 #include "Attack.h"
 #include "Bench.h"
+#include "Evaluation.h"
 #include "Memory.h"
 #include "MoveGen.h"
 #include "Nnue.h"
@@ -361,6 +364,14 @@ constexpr int DEFAULT_UCI_DEPTH = 8;
     return use_nnue && nnue::loaded() ? "nnue" : "hce";
 }
 
+[[nodiscard]] inline int white_pov_score(const Position& pos, int stm_score) noexcept {
+    return pos.side_to_move == WHITE ? stm_score : -stm_score;
+}
+
+[[nodiscard]] inline int white_pov_winrate(const Position& pos, int stm_wr) noexcept {
+    return pos.side_to_move == WHITE ? stm_wr : (1000 - stm_wr);
+}
+
 void handle_setoption(
     memory::Memory& mem,
     bool& use_nnue,
@@ -423,6 +434,7 @@ void handle_setoption(
 
 [[nodiscard]] bool parse_go_command(
     const Position& pos,
+    const memory::Memory& mem,
     timeman::TimeManager& time_manager,
     std::string_view command,
     search::SearchLimits& limits
@@ -434,6 +446,7 @@ void handle_setoption(
 
     timeman::GoParams params{};
     bool has_limit = false;
+    limits.root_move_count = 0;
 
     iss >> token; // go
 
@@ -504,6 +517,32 @@ void handle_setoption(
         else if (token == "infinite") {
             params.infinite = true;
             has_limit = true;
+        }
+        else if (token == "searchmoves") {
+            std::string move_token;
+            while (iss >> move_token) {
+                Move move = 0;
+                if (!find_uci_move(pos, mem, move_token, move))
+                    return false;
+
+                bool duplicate = false;
+                for (int i = 0; i < limits.root_move_count; ++i) {
+                    if (limits.root_moves[i] == move) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate)
+                    continue;
+
+                if (limits.root_move_count >= 256)
+                    return false;
+                limits.root_moves[limits.root_move_count++] = move;
+            }
+
+            if (limits.root_move_count == 0)
+                return false;
+            break;
         }
     }
 
@@ -580,8 +619,7 @@ void handle_setoption(
 } // namespace
 
 int run_uci() {
-    // The main loop is synchronous: each go command searches immediately and
-    // prints a bestmove before the next command is read.
+    // UCI command loop with cooperative stop support.
     memory::Memory mem{};
     memory::memory_init(mem, 64, 8, 2);
     attack_init_backend(mem);
@@ -592,9 +630,28 @@ int run_uci() {
     timeman::TimeManager time_manager{};
     bool use_nnue = false;
     std::string eval_file = default_eval_file();
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> search_running{false};
+    std::thread search_thread;
+
+    auto join_finished_search = [&]() {
+        if (search_thread.joinable() &&
+            !search_running.load(std::memory_order_acquire)) {
+            search_thread.join();
+        }
+    };
+
+    auto stop_search = [&]() {
+        stop_requested.store(true, std::memory_order_release);
+        if (search_thread.joinable())
+            search_thread.join();
+        search_running.store(false, std::memory_order_release);
+    };
 
     std::string line;
     while (std::getline(std::cin, line)) {
+        join_finished_search();
+
         if (line == "uci") {
             std::cout << "id name Valerain\n";
             std::cout << "id author Mazhaoze\n";
@@ -607,6 +664,16 @@ int run_uci() {
         else if (line == "isready") {
             std::cout << "readyok\n";
         }
+        else if (line == "stop") {
+            stop_search();
+        }
+        else if (line == "quit") {
+            stop_search();
+            break;
+        }
+        else if (search_running.load(std::memory_order_acquire)) {
+            std::cout << "info string search busy, send stop first\n";
+        }
         else if (line == "ucinewgame") {
             memory::memory_clear_hash(mem);
             set_start_position(pos);
@@ -616,13 +683,34 @@ int run_uci() {
         else if (line.rfind("setoption", 0) == 0) {
             handle_setoption(mem, use_nnue, eval_file, std::cout, line);
         }
+        else if (line == "eval") {
+            std::cout << "info string eval " << active_eval_name(use_nnue) << '\n';
+            const int hce_stm = eval::evaluate(pos);
+            std::cout << "info string hce cp " << white_pov_score(pos, hce_stm) << '\n';
+
+            if (!nnue::loaded())
+                (void)ensure_nnue_loaded(eval_file, nullptr);
+
+            if (nnue::loaded()) {
+                const int raw_stm = nnue::eval(pos);
+                const int cp_stm = nnue::to_cp(raw_stm, pos);
+                const int winrate_stm = nnue::win_rate_model(raw_stm, pos);
+
+                std::cout << "info string nnue raw " << white_pov_score(pos, raw_stm) << '\n';
+                std::cout << "info string nnue cp " << white_pov_score(pos, cp_stm) << '\n';
+                std::cout << "info string nnue winrate "
+                          << white_pov_winrate(pos, winrate_stm) << '\n';
+            } else {
+                std::cout << "info string nnue unavailable\n";
+            }
+        }
         else if (line.rfind("position", 0) == 0) {
             if (!set_position_from_command(pos, mem, std::string_view(line).substr(9)))
                 std::cout << "info string invalid position command\n";
         }
         else if (line.rfind("go", 0) == 0) {
             search::SearchLimits limits{};
-            if (!parse_go_command(pos, time_manager, line, limits)) {
+            if (!parse_go_command(pos, mem, time_manager, line, limits)) {
                 std::cout << "info string usage: " << go_usage_hint() << '\n';
                 std::cout << "info string " << go_usage_examples() << '\n';
                 continue;
@@ -632,20 +720,27 @@ int run_uci() {
                 std::cout << "info string nnue unavailable, search will use hce\n";
 
             limits.use_nnue = use_nnue;
+            limits.stop = &stop_requested;
+            stop_requested.store(false, std::memory_order_release);
 
-            std::cout << "info string eval " << active_eval_name(limits.use_nnue) << '\n';
-            const auto search_start = std::chrono::steady_clock::now();
-            const search::SearchResult result =
-                search::iterative_deepening(pos, mem, limits, &std::cout);
-            const auto search_end = std::chrono::steady_clock::now();
-            const int elapsed_ms = static_cast<int>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    search_end - search_start
-                ).count()
-            );
-            time_manager.record_search(pos, limits, result, elapsed_ms);
+            const Position root = pos;
+            search_running.store(true, std::memory_order_release);
+            search_thread = std::thread([&, root, limits]() {
+                std::cout << "info string eval " << active_eval_name(limits.use_nnue) << '\n';
+                const auto search_start = std::chrono::steady_clock::now();
+                const search::SearchResult result =
+                    search::iterative_deepening(root, mem, limits, &std::cout);
+                const auto search_end = std::chrono::steady_clock::now();
+                const int elapsed_ms = static_cast<int>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        search_end - search_start
+                    ).count()
+                );
+                time_manager.record_search(root, limits, result, elapsed_ms);
 
-            std::cout << "bestmove " << search::move_to_uci(result.best_move) << '\n';
+                std::cout << "bestmove " << search::move_to_uci(result.best_move) << '\n';
+                search_running.store(false, std::memory_order_release);
+            });
         }
         else if (line.rfind("perft", 0) == 0) {
             int depth = -1;
@@ -658,14 +753,9 @@ int run_uci() {
 
             divide(pos, mem, depth, std::cout, threads, true);
         }
-        else if (line == "stop") {
-            // The current search is synchronous, so stop is a no-op for now.
-        }
-        else if (line == "quit") {
-            break;
-        }
     }
 
+    stop_search();
     memory::memory_free(mem);
     return 0;
 }
