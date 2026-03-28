@@ -62,6 +62,7 @@ struct SearchResult {
     Score score = 0;
     u64 nodes = 0;
     int depth = 0;
+    int seldepth = 0;
 };
 
 // Converts the internal 16-bit move format into UCI coordinate notation.

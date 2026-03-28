@@ -101,7 +101,7 @@ constexpr SeeScalePreset SEE_TERM_PRESET = SeeScalePreset::Strong;
 #endif
 
 #ifndef VALERAIN_MOVEPICKER_OBS
-#define VALERAIN_MOVEPICKER_OBS 1
+#define VALERAIN_MOVEPICKER_OBS 0
 #endif
 
 constexpr int piece_order_value[PIECE_TYPE_NB] = {
@@ -119,6 +119,22 @@ constexpr int piece_order_value[PIECE_TYPE_NB] = {
     return victim_value * 32 - attacker_value;
 }
 
+inline void append_uci_score(std::ostream& out, int score) {
+    if (score >= VALUE_MATE - MAX_PLY) {
+        const int plies_to_mate = VALUE_MATE - score;
+        out << "score mate " << ((plies_to_mate + 1) / 2);
+        return;
+    }
+
+    if (score <= -VALUE_MATE + MAX_PLY) {
+        const int plies_to_mate = VALUE_MATE + score;
+        out << "score mate -" << ((plies_to_mate + 1) / 2);
+        return;
+    }
+
+    out << "score cp " << score;
+}
+
 /*
 Searcher owns the mutable state for one iterative-deepening session: node
 counting, killer/history tables, PV storage, and stop-condition bookkeeping.
@@ -131,6 +147,7 @@ struct Searcher {
 
     u64 nodes = 0;
     u64 base_nodes = 0;
+    int seldepth = 0;
     HistoryTables history_tables{};
     Move pv_table[MAX_PLY][MAX_PLY]{};
     int pv_length[MAX_PLY + 1]{};
@@ -658,6 +675,11 @@ struct Searcher {
         return base_nodes + nodes;
     }
 
+    inline void update_seldepth(int ply) noexcept {
+        if (ply > seldepth)
+            seldepth = ply;
+    }
+
     [[nodiscard]] inline int elapsed_ms() const noexcept {
         return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
             clock::now() - start_time
@@ -966,6 +988,7 @@ struct Searcher {
         // evasions when in check) so the engine does not stand pat in unstable positions.
         pv_length[ply] = 0;
         rep_keys[ply] = pos.key;
+        update_seldepth(ply);
         ++nodes;
         poll_limits();
         if (stopped)
@@ -1100,6 +1123,7 @@ struct Searcher {
         // - promising moves are re-searched on a wider window
         pv_length[ply] = 0;
         rep_keys[ply] = pos.key;
+        update_seldepth(ply);
 
         if (stopped)
             return alpha;
@@ -1276,7 +1300,7 @@ struct Searcher {
             const int move_index = moves_tried - 1;
             ++legal_count;
             const bool capture_move = move_is_capture(move);
-            const bool bad_capture = picker.last_was_bad_capture();
+            [[maybe_unused]] const bool bad_capture = picker.last_was_bad_capture();
             const bool quiet_move =
                 !capture_move &&
                 !move_is_promotion(move) &&
@@ -1624,6 +1648,7 @@ struct Searcher {
         // Root search mirrors PVS, but it also keeps the best move/result for UCI output.
         SearchResult result{};
         result.depth = depth;
+        update_seldepth(0);
         rep_keys[0] = root.key;
 
         MoveList list;
@@ -1704,6 +1729,7 @@ struct Searcher {
         if (legal_count == 0) {
             result.score = checked ? -VALUE_MATE : 0;
             result.best_move = 0;
+            result.seldepth = seldepth;
             return result;
         }
 
@@ -1712,6 +1738,7 @@ struct Searcher {
 
         result.score = best_score;
         result.nodes = nodes;
+        result.seldepth = seldepth;
         save_tt(root, depth, 0, best_score, static_eval, result.best_move, alpha0, beta, true);
         return result;
     }
@@ -1783,6 +1810,7 @@ SearchResult iterative_deepening(
 
             searcher.nodes = 0;
             searcher.base_nodes = total_nodes + depth_nodes;
+            searcher.seldepth = 0;
             std::fill(std::begin(searcher.pv_length), std::end(searcher.pv_length), 0);
             std::fill(std::begin(searcher.move_stack), std::end(searcher.move_stack), Move(0));
             std::fill(
@@ -1792,6 +1820,7 @@ SearchResult iterative_deepening(
             );
 
             current = searcher.search_root(keyed_root, depth, hint_move, alpha, beta);
+            current.seldepth = searcher.seldepth;
             depth_nodes += current.nodes;
 
             if (searcher.stopped || depth == 1)
@@ -1830,13 +1859,15 @@ SearchResult iterative_deepening(
             const u64 nps = seconds > 0.0
                 ? static_cast<u64>(static_cast<double>(total_nodes) / seconds)
                 : 0ULL;
+            const u64 time_ms = static_cast<u64>(seconds * 1000.0);
 
             *out << "info depth " << depth
-                 << " score cp " << current.score
-                 << " nodes " << total_nodes
-                 << " time " << static_cast<u64>(seconds * 1000.0)
+                 << " seldepth " << current.seldepth << ' ';
+            append_uci_score(*out, current.score);
+            *out << " nodes " << total_nodes
                  << " nps " << nps
                  << " hashfull " << memory::tt_hashfull(mem.tt)
+                 << " time " << time_ms
                  << " pv";
 
             for (int i = 0; i < searcher.pv_length[0]; ++i)

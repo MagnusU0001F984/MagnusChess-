@@ -730,7 +730,6 @@ int run_uci() {
             const Position root = pos;
             search_running.store(true, std::memory_order_release);
             search_thread = std::thread([&, root, limits]() {
-                std::cout << "info string eval " << active_eval_name(limits.use_nnue) << '\n';
                 const auto search_start = std::chrono::steady_clock::now();
                 const search::SearchResult result =
                     search::iterative_deepening(root, mem, limits, &std::cout);
