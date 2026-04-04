@@ -35,6 +35,8 @@ entry based on depth, age, and bound quality.
 
 namespace valerain::memory {
 
+constexpr int TT_CLUSTER_SIZE = 4;
+
 namespace {
 
 [[nodiscard]] inline u32 tt_tag32_from_key(Key key) noexcept {
@@ -302,7 +304,7 @@ int tt_hashfull(const TT& tt, int sample_clusters) noexcept {
 
     for (int i = 0; i < n; ++i) {
         const TTCluster& c = tt.clusters[i];
-        for (int lane = 0; lane < 4; ++lane) {
+        for (int lane = 0; lane < TT_CLUSTER_SIZE; ++lane) {
             ++total;
             used += (c.age[lane] == tt.generation);
         }

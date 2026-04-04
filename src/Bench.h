@@ -45,6 +45,7 @@ struct BenchConfig {
     std::size_t threads = 1ULL;
     bool divide = false;
     bool search = false;
+    bool regression = false;
     bool live_divide = false;
 };
 
@@ -67,6 +68,7 @@ void set_start_position(Position& pos) noexcept;
 );
 
 [[nodiscard]] BenchConfig parse_config(int argc, char** argv) noexcept;
+int run_regression_tests();
 int run_bench(int argc, char** argv);
 
 } // namespace valerain

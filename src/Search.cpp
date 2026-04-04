@@ -1026,7 +1026,8 @@ struct Searcher {
             // Stand-pat: if the static position already fails high, no capture
             // search can make it worse for the side to move.
             if (static_eval >= beta) {
-                save_tt(pos, 0, ply, static_eval, static_eval, tt_move, alpha0, beta, pv_node);
+                if (!stopped)
+                    save_tt(pos, 0, ply, static_eval, static_eval, tt_move, alpha0, beta, pv_node);
                 return static_eval;
             }
             if (static_eval > alpha)
@@ -1041,7 +1042,8 @@ struct Searcher {
 
         if (list.size == 0) {
             const int score = checked ? (-VALUE_MATE + ply) : alpha;
-            save_tt(pos, 0, ply, score, static_eval, 0, alpha0, beta, pv_node);
+            if (!stopped)
+                save_tt(pos, 0, ply, score, static_eval, 0, alpha0, beta, pv_node);
             return score;
         }
 
@@ -1103,11 +1105,13 @@ struct Searcher {
 
         if (legal_count == 0) {
             const int score = checked ? (-VALUE_MATE + ply) : alpha;
-            save_tt(pos, 0, ply, score, static_eval, 0, alpha0, beta, pv_node);
+            if (!stopped)
+                save_tt(pos, 0, ply, score, static_eval, 0, alpha0, beta, pv_node);
             return score;
         }
 
-        save_tt(pos, 0, ply, alpha, static_eval, best_move, alpha0, beta, pv_node);
+        if (!stopped)
+            save_tt(pos, 0, ply, alpha, static_eval, best_move, alpha0, beta, pv_node);
         return alpha;
     }
 
@@ -1218,7 +1222,8 @@ struct Searcher {
             undo_null_move(pos, null_state);
 
             if (score >= beta) {
-                save_tt(pos, search_depth, ply, score, static_eval, 0, alpha0, beta, pv_node);
+                if (!stopped)
+                    save_tt(pos, search_depth, ply, score, static_eval, 0, alpha0, beta, pv_node);
                 return score;
             }
         }
@@ -1598,7 +1603,8 @@ struct Searcher {
 
         if (legal_count == 0) {
             const int score = checked ? (-VALUE_MATE + ply) : 0;
-            save_tt(pos, search_depth, ply, score, static_eval, 0, alpha0, beta, pv_node);
+            if (!stopped)
+                save_tt(pos, search_depth, ply, score, static_eval, 0, alpha0, beta, pv_node);
             return score;
         }
 
@@ -1636,7 +1642,8 @@ struct Searcher {
             );
         }
 
-        save_tt(pos, search_depth, ply, alpha, static_eval, best_move, alpha0, beta, pv_node);
+        if (!stopped)
+            save_tt(pos, search_depth, ply, alpha, static_eval, best_move, alpha0, beta, pv_node);
         return alpha;
     }
 
@@ -1683,12 +1690,19 @@ struct Searcher {
         const int static_eval = probe.hit ? probe.data.eval : evaluate_position(root);
         const int alpha0 = alpha;
         const bool checked = in_check(root);
+        Move fallback_move = Move(0);
+        for (int i = 0; i < list.size; ++i) {
+            if (legal_fast(root, mem, info, list.moves[i])) {
+                fallback_move = list.moves[i];
+                break;
+            }
+        }
 
         ScoredMoveList scored;
         score_moves(root, list, scored, root_hint, 0, depth);
         int best_score = -VALUE_INF;
         int legal_count = 0;
-        result.best_move = 0;
+        result.best_move = fallback_move;
 
         for (int i = 0; i < scored.size; ++i) {
             if (hit_hard_limit())
@@ -1729,8 +1743,16 @@ struct Searcher {
         }
 
         if (legal_count == 0) {
+            if (fallback_move != 0) {
+                result.score = static_eval;
+                result.best_move = fallback_move;
+                result.nodes = nodes;
+                result.seldepth = seldepth;
+                return result;
+            }
             result.score = checked ? -VALUE_MATE : 0;
             result.best_move = 0;
+            result.nodes = nodes;
             result.seldepth = seldepth;
             return result;
         }
@@ -1741,7 +1763,8 @@ struct Searcher {
         result.score = best_score;
         result.nodes = nodes;
         result.seldepth = seldepth;
-        save_tt(root, depth, 0, best_score, static_eval, result.best_move, alpha0, beta, true);
+        if (!stopped)
+            save_tt(root, depth, 0, best_score, static_eval, result.best_move, alpha0, beta, true);
         return result;
     }
 };

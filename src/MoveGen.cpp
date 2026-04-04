@@ -154,8 +154,22 @@ inline Bitboard pin_mask_for(
     const GenInfo& info,
     Square from
 ) noexcept {
-    // A pinned piece may only move along the line between the king and the pinner.
-    return (info.pinned & bb_of(from)) ? line_bb(mem, info.king_sq, from) : ~0ULL;
+    const Bitboard from_bb = bb_of(from);
+    if ((info.pinned & from_bb) == 0ULL)
+        return ~0ULL;
+
+    // A pinned piece may move anywhere on the full king-pinner ray, including
+    // captures of the pinner beyond the pinned piece itself.
+    Bitboard pinners = info.pinners;
+    while (pinners) {
+        const Square pinner_sq = lsb_sq(pinners);
+        pinners &= pinners - 1;
+
+        if ((between_bb(mem, info.king_sq, pinner_sq) & from_bb) != 0ULL)
+            return line_bb(mem, info.king_sq, pinner_sq);
+    }
+
+    return line_bb(mem, info.king_sq, from);
 }
 
 inline Move* generate_knight_evasions(

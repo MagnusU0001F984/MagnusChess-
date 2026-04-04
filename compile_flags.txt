@@ -1,0 +1,8 @@
+-std=gnu++20
+-xc++
+-I.
+-D_DEBUG
+-DUNICODE
+-D_UNICODE
+-D__AVX2__
+-D__BMI2__
