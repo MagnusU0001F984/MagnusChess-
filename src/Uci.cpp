@@ -57,6 +57,29 @@ namespace {
 constexpr int DEFAULT_UCI_DEPTH = 8;
 constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
 
+struct PositionHistory {
+    Key keys[search::MAX_GAME_HISTORY]{};
+    int count = 0;
+};
+
+inline void clear_position_history(PositionHistory& history) noexcept {
+    history.count = 0;
+}
+
+inline void push_position_history(
+    PositionHistory& history,
+    Key key
+) noexcept {
+    if (history.count < search::MAX_GAME_HISTORY) {
+        history.keys[history.count++] = key;
+        return;
+    }
+
+    for (int i = 1; i < search::MAX_GAME_HISTORY; ++i)
+        history.keys[i - 1] = history.keys[i];
+    history.keys[search::MAX_GAME_HISTORY - 1] = key;
+}
+
 [[nodiscard]] constexpr const char* go_usage_hint() noexcept {
     return "go <depth/movetime/nodes>";
 }
@@ -288,7 +311,8 @@ constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
 [[nodiscard]] bool apply_move_list(
     Position& pos,
     const memory::Memory& mem,
-    std::istringstream& iss
+    std::istringstream& iss,
+    PositionHistory& history
 ) noexcept {
     std::string move_token;
     while (iss >> move_token) {
@@ -296,7 +320,12 @@ constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
         if (!find_uci_move(pos, mem, move_token, move))
             return false;
 
+        const Key prev_key = pos.key;
         do_move_copy(pos, move, mem.tables);
+        if (pos.halfmove_clock == 0)
+            clear_position_history(history);
+        else
+            push_position_history(history, prev_key);
     }
 
     return true;
@@ -305,7 +334,8 @@ constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
 [[nodiscard]] bool set_position_from_command(
     Position& pos,
     const memory::Memory& mem,
-    std::string_view command
+    std::string_view command,
+    PositionHistory& history
 ) noexcept {
     std::istringstream iss{std::string(command)};
     std::string token;
@@ -335,13 +365,15 @@ constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
         return false;
     }
 
+    clear_position_history(history);
+
     if (!(iss >> token))
         return true;
 
     if (token != "moves")
         return false;
 
-    return apply_move_list(pos, mem, iss);
+    return apply_move_list(pos, mem, iss, history);
 }
 
 [[nodiscard]] bool ensure_nnue_loaded(
@@ -632,6 +664,7 @@ int run_uci() {
     Position pos{};
     set_start_position(pos);
     position_refresh_key(pos, mem.tables);
+    PositionHistory position_history{};
     timeman::TimeManager time_manager{};
     bool use_nnue = false;
     std::string eval_file = default_eval_file();
@@ -685,6 +718,7 @@ int run_uci() {
             memory::memory_clear_hash(mem);
             set_start_position(pos);
             position_refresh_key(pos, mem.tables);
+            clear_position_history(position_history);
             time_manager.new_game();
         }
         else if (line.rfind("setoption", 0) == 0) {
@@ -729,7 +763,12 @@ int run_uci() {
                 std::cout << "info string bench failed\n";
         }
         else if (line.rfind("position", 0) == 0) {
-            if (!set_position_from_command(pos, mem, std::string_view(line).substr(9)))
+            if (!set_position_from_command(
+                    pos,
+                    mem,
+                    std::string_view(line).substr(9),
+                    position_history
+                ))
                 std::cout << "info string invalid position command\n";
         }
         else if (line.rfind("go", 0) == 0) {
@@ -745,6 +784,9 @@ int run_uci() {
 
             limits.use_nnue = use_nnue;
             limits.stop = &stop_requested;
+            limits.game_history_count = position_history.count;
+            for (int i = 0; i < position_history.count; ++i)
+                limits.game_history_keys[i] = position_history.keys[i];
             stop_requested.store(false, std::memory_order_release);
 
             const Position root = pos;

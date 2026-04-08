@@ -42,6 +42,7 @@ with a small set of pragmatic pruning heuristics.
 */
 
 constexpr int MAX_PLY = 128;
+constexpr int MAX_GAME_HISTORY = 512;
 
 struct SearchLimits {
     // Depth, node, and time limits supplied by bench mode or UCI.
@@ -51,6 +52,8 @@ struct SearchLimits {
     int hard_time_ms = 0;
     bool infinite = false;
     bool use_nnue = false;
+    Key game_history_keys[MAX_GAME_HISTORY]{};
+    int game_history_count = 0;
     Move root_moves[256]{};
     int root_move_count = 0;
     const std::atomic<bool>* stop = nullptr;

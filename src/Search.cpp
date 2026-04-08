@@ -25,6 +25,7 @@ SOFTWARE.
 #include "Search.h"
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <iostream>
@@ -54,7 +55,9 @@ namespace {
 // Small fixed margins keep the implementation simple and the runtime overhead low.
 constexpr int VALUE_INF = 32000;
 constexpr int VALUE_MATE = 31000;
+constexpr int VALUE_NONE = 32002;
 constexpr int DELTA_MARGIN = 200;
+constexpr int QS_ADJ_SHUFFLE_CAP = 80;
 constexpr int FUTILITY_MARGIN[3] = { 0, 120, 240 };
 constexpr int REVERSE_FUTILITY_MARGIN[4] = { 0, 90, 180, 300 };
 constexpr int RAZOR_MARGIN[3] = { 0, 280, 420 };
@@ -80,6 +83,17 @@ constexpr int SEE_LATE_BAD_CAPTURE_GATE_MIN_DEPTH = 4;
 constexpr int SEE_LATE_BAD_CAPTURE_GATE_MAX_DEPTH = 8;
 constexpr int SEE_LATE_BAD_CAPTURE_GATE_MIN_CAPTURE_INDEX = 4;
 constexpr int HASHFULL_REPORT_PERIOD = 4;
+constexpr int CORRECTION_HISTORY_SIZE = 16384;
+constexpr int CORRECTION_HISTORY_GRAIN = 16;
+constexpr int CORRECTION_HISTORY_CLAMP = 256;
+constexpr int CORRECTION_HISTORY_WEIGHT_MAX = 96;
+constexpr int CORRECTION_POSITION_WEIGHT = 2;
+constexpr int CORRECTION_PAWN_WEIGHT = 2;
+constexpr int CORRECTION_MATERIAL_WEIGHT = 1;
+constexpr int CORRECTION_WEIGHT_SUM =
+    CORRECTION_POSITION_WEIGHT
+    + CORRECTION_PAWN_WEIGHT
+    + CORRECTION_MATERIAL_WEIGHT;
 
 #ifndef VALERAIN_SEARCH_OBS
 #define VALERAIN_SEARCH_OBS 0
@@ -162,6 +176,19 @@ Searcher owns the mutable state for one iterative-deepening session: node
 counting, killer/history tables, PV storage, and stop-condition bookkeeping.
 */
 struct Searcher {
+    struct CorrectionKeys {
+        Key position = 0;
+        Key pawn_king = 0;
+        Key material = 0;
+    };
+
+    struct StaticEvalInfo {
+        int raw = VALUE_NONE;
+        int corrected = 0;
+        int stand_pat = 0;
+        bool from_tt = false;
+    };
+
     using clock = std::chrono::steady_clock;
 
     memory::Memory& mem;
@@ -178,6 +205,9 @@ struct Searcher {
     SearchStackEntry search_stack[MAX_PLY + 2]{};
     int static_eval_stack[MAX_PLY + 1]{};
     bool static_eval_valid[MAX_PLY + 1]{};
+    i16 position_correction_history[COLOR_NB][CORRECTION_HISTORY_SIZE]{};
+    i16 pawn_correction_history[COLOR_NB][CORRECTION_HISTORY_SIZE]{};
+    i16 material_correction_history[COLOR_NB][CORRECTION_HISTORY_SIZE]{};
     clock::time_point start_time{};
     bool stopped = false;
     bool hard_stop = false;
@@ -775,6 +805,149 @@ struct Searcher {
         return eval::evaluate(pos);
     }
 
+    [[nodiscard]] static inline bool tt_eval_available(
+        const memory::TTProbe& probe
+    ) noexcept {
+        return probe.hit && probe.data.eval != VALUE_NONE;
+    }
+
+    [[nodiscard]] static inline std::size_t correction_index(Key key) noexcept {
+        return static_cast<std::size_t>(mix64(key)) & (CORRECTION_HISTORY_SIZE - 1);
+    }
+
+    [[nodiscard]] static inline int packed_piece_count(
+        const Position& pos,
+        Color color,
+        PieceType piece_type
+    ) noexcept {
+        return std::popcount(static_cast<u64>(pieces(pos, color, piece_type)));
+    }
+
+    [[nodiscard]] CorrectionKeys correction_keys(const Position& pos) const noexcept {
+        CorrectionKeys keys{};
+        keys.position = pos.key;
+        keys.pawn_king =
+            pieces(pos, WHITE, PAWN)
+            ^ std::rotl(pieces(pos, BLACK, PAWN), 7)
+            ^ std::rotl(pieces(pos, WHITE, KING), 19)
+            ^ std::rotl(pieces(pos, BLACK, KING), 29);
+
+        u64 material = 0;
+        int shift = 0;
+        for (int color = WHITE; color <= BLACK; ++color) {
+            material |= static_cast<u64>(packed_piece_count(
+                pos,
+                static_cast<Color>(color),
+                PAWN
+            )) << shift;
+            shift += 4;
+            material |= static_cast<u64>(packed_piece_count(
+                pos,
+                static_cast<Color>(color),
+                KNIGHT
+            )) << shift;
+            shift += 4;
+            material |= static_cast<u64>(packed_piece_count(
+                pos,
+                static_cast<Color>(color),
+                BISHOP
+            )) << shift;
+            shift += 4;
+            material |= static_cast<u64>(packed_piece_count(
+                pos,
+                static_cast<Color>(color),
+                ROOK
+            )) << shift;
+            shift += 4;
+            material |= static_cast<u64>(packed_piece_count(
+                pos,
+                static_cast<Color>(color),
+                QUEEN
+            )) << shift;
+            shift += 4;
+        }
+        material |= static_cast<u64>(pos.eval_phase & 0x3F) << shift;
+        keys.material = material;
+        return keys;
+    }
+
+    [[nodiscard]] static inline int correction_slot_value(
+        const i16 table[CORRECTION_HISTORY_SIZE],
+        Key key
+    ) noexcept {
+        return static_cast<int>(table[correction_index(key)]);
+    }
+
+    inline void update_correction_slot(
+        i16& slot,
+        int target,
+        int weight
+    ) noexcept {
+        const int next =
+            static_cast<int>(slot)
+            + ((target - static_cast<int>(slot)) * weight) / 128;
+        slot = static_cast<i16>(std::clamp(
+            next,
+            -CORRECTION_HISTORY_CLAMP * CORRECTION_HISTORY_GRAIN,
+            CORRECTION_HISTORY_CLAMP * CORRECTION_HISTORY_GRAIN
+        ));
+    }
+
+    [[nodiscard]] inline int correction_value(const Position& pos) const noexcept {
+        const Color side = static_cast<Color>(pos.side_to_move);
+        const CorrectionKeys keys = correction_keys(pos);
+        const int stored =
+            CORRECTION_POSITION_WEIGHT
+                * correction_slot_value(position_correction_history[side], keys.position)
+            + CORRECTION_PAWN_WEIGHT
+                * correction_slot_value(pawn_correction_history[side], keys.pawn_king)
+            + CORRECTION_MATERIAL_WEIGHT
+                * correction_slot_value(material_correction_history[side], keys.material);
+        return std::clamp(
+            stored / (CORRECTION_HISTORY_GRAIN * CORRECTION_WEIGHT_SUM),
+            -CORRECTION_HISTORY_CLAMP,
+            CORRECTION_HISTORY_CLAMP
+        );
+    }
+
+    inline void update_correction_history(
+        const Position& pos,
+        int raw_eval,
+        int score,
+        int depth
+    ) noexcept {
+        if (raw_eval == VALUE_NONE || is_mate_window(score))
+            return;
+
+        const Color side = static_cast<Color>(pos.side_to_move);
+        const CorrectionKeys keys = correction_keys(pos);
+        const int delta = std::clamp(
+            score - raw_eval,
+            -CORRECTION_HISTORY_CLAMP,
+            CORRECTION_HISTORY_CLAMP
+        );
+        const int target = delta * CORRECTION_HISTORY_GRAIN;
+        const int weight = std::min(
+            CORRECTION_HISTORY_WEIGHT_MAX,
+            16 + std::max(1, depth) * 8
+        );
+        update_correction_slot(
+            position_correction_history[side][correction_index(keys.position)],
+            target,
+            weight
+        );
+        update_correction_slot(
+            pawn_correction_history[side][correction_index(keys.pawn_king)],
+            target,
+            weight
+        );
+        update_correction_slot(
+            material_correction_history[side][correction_index(keys.material)],
+            target,
+            weight
+        );
+    }
+
     inline void store_static_eval(int ply, int static_eval) noexcept {
         static_eval_stack[ply] = static_eval;
         static_eval_valid[ply] = true;
@@ -789,27 +962,37 @@ struct Searcher {
         return static_eval >= static_eval_stack[ply - 2] + IMPROVING_MARGIN;
     }
 
-    [[nodiscard]] bool is_threefold_repetition(
+    [[nodiscard]] bool is_repetition_draw(
         const Position& pos,
         int ply
     ) const noexcept {
-        int matches = 0;
+        int matches = 1;
+        const int history_count = std::min(limits.game_history_count, pos.halfmove_clock);
+        const int history_start = limits.game_history_count - history_count;
+        for (int i = history_start; i < limits.game_history_count; ++i) {
+            if (limits.game_history_keys[i] != pos.key)
+                continue;
+            if (++matches >= 3)
+                return true;
+        }
+
         const int back = std::min(ply, pos.halfmove_clock);
         const int min_ply = ply - back;
 
         for (int p = ply - 2; p >= min_ply; p -= 2) {
             if (rep_keys[p] != pos.key)
                 continue;
-            if (++matches >= 2)
+            if (++matches >= 3)
                 return true;
         }
 
         return false;
     }
 
-    [[nodiscard]] inline int repetition_score(const Position& pos) const noexcept {
-        const int static_eval = evaluate_position(pos);
-        return static_eval > 0 ? REPETITION_AVOID_SCORE : 0;
+    [[nodiscard]] inline int repetition_score(int eval_hint = VALUE_NONE) const noexcept {
+        if (eval_hint == VALUE_NONE)
+            return 0;
+        return eval_hint > 0 ? REPETITION_AVOID_SCORE : 0;
     }
 
     [[nodiscard]] bool has_null_move_pruning_material(
@@ -871,6 +1054,12 @@ struct Searcher {
         return probe.hit ? static_cast<Move>(probe.data.move) : Move(0);
     }
 
+    [[nodiscard]] inline int tt_eval_from_probe(
+        const memory::TTProbe& probe
+    ) const noexcept {
+        return tt_eval_available(probe) ? probe.data.eval : VALUE_NONE;
+    }
+
     [[nodiscard]] inline bool tt_cutoff(
         const memory::TTProbe& probe,
         int depth,
@@ -901,7 +1090,7 @@ struct Searcher {
         int depth,
         int ply,
         int score,
-        int static_eval,
+        int tt_eval,
         Move best_move,
         int alpha,
         int beta,
@@ -912,11 +1101,51 @@ struct Searcher {
             pos.key,
             best_move,
             static_cast<i16>(score_to_tt(score, ply)),
-            static_cast<i16>(static_eval),
+            static_cast<i16>(tt_eval),
             static_cast<i16>(depth),
             bound_from_score(score, alpha, beta),
             pv_node
         );
+    }
+
+    [[nodiscard]] StaticEvalInfo resolve_static_eval(
+        const Position& pos,
+        const memory::TTProbe& probe,
+        int ply,
+        bool checked,
+        bool qsearch_node
+    ) const noexcept {
+        StaticEvalInfo info{};
+        info.from_tt = tt_eval_available(probe);
+        info.raw = info.from_tt ? probe.data.eval : evaluate_position(pos);
+        info.corrected = std::clamp(info.raw + correction_value(pos), -VALUE_INF, VALUE_INF);
+        info.stand_pat = info.corrected;
+
+        if (!qsearch_node || checked || !probe.hit)
+            return info;
+
+        const int tt_score = score_from_tt(probe.data.score, ply);
+        if (is_mate_window(tt_score))
+            return info;
+
+        switch (tt_bound_from_probe(probe)) {
+            case memory::BOUND_LOWER: {
+                const int gap = tt_score - info.stand_pat;
+                if (gap > 0)
+                    info.stand_pat += std::min(QS_ADJ_SHUFFLE_CAP, std::max(1, gap / 2));
+                break;
+            }
+            case memory::BOUND_UPPER: {
+                const int gap = info.stand_pat - tt_score;
+                if (gap > 0)
+                    info.stand_pat -= std::min(QS_ADJ_SHUFFLE_CAP, std::max(1, gap / 2));
+                break;
+            }
+            default:
+                break;
+        }
+
+        return info;
     }
 
     // PV lines are copied upward every time a child improves alpha.
@@ -1014,8 +1243,6 @@ struct Searcher {
 
         if (pos.halfmove_clock >= 100)
             return 0;
-        if (is_threefold_repetition(pos, ply))
-            return repetition_score(pos);
 
         alpha = std::max(alpha, -VALUE_MATE + ply);
         beta = std::min(beta, VALUE_MATE - ply - 1);
@@ -1025,6 +1252,8 @@ struct Searcher {
         const int alpha0 = alpha;
         const bool pv_node = (beta - alpha) > 1;
         const memory::TTProbe probe = memory::tt_probe(mem.tt, pos.key);
+        if (is_repetition_draw(pos, ply))
+            return repetition_score(tt_eval_from_probe(probe));
 
         int tt_score = 0;
         if (tt_cutoff(probe, 0, alpha, beta, ply, tt_score))
@@ -1032,18 +1261,21 @@ struct Searcher {
 
         const bool checked = in_check(pos);
         const Move tt_move = tt_move_from_probe(probe);
-        const int static_eval = probe.hit ? probe.data.eval : evaluate_position(pos);
+        const StaticEvalInfo eval_info = resolve_static_eval(pos, probe, ply, checked, true);
+        const int raw_eval = eval_info.raw;
+        const int static_eval = eval_info.corrected;
+        const int stand_pat_eval = eval_info.stand_pat;
         store_static_eval(ply, static_eval);
 
         if (!checked) {
             // Stand-pat: if the static position already fails high, no capture
             // search can make it worse for the side to move.
-            if (static_eval >= beta) {
-                save_tt(pos, 0, ply, static_eval, static_eval, tt_move, alpha0, beta, pv_node);
-                return static_eval;
+            if (stand_pat_eval >= beta) {
+                save_tt(pos, 0, ply, stand_pat_eval, raw_eval, tt_move, alpha0, beta, pv_node);
+                return stand_pat_eval;
             }
-            if (static_eval > alpha)
-                alpha = static_eval;
+            if (stand_pat_eval > alpha)
+                alpha = stand_pat_eval;
         }
 
         MoveList list;
@@ -1054,7 +1286,7 @@ struct Searcher {
 
         if (list.size == 0) {
             const int score = checked ? (-VALUE_MATE + ply) : alpha;
-            save_tt(pos, 0, ply, score, static_eval, 0, alpha0, beta, pv_node);
+            save_tt(pos, 0, ply, score, raw_eval, 0, alpha0, beta, pv_node);
             return score;
         }
 
@@ -1116,11 +1348,11 @@ struct Searcher {
 
         if (legal_count == 0) {
             const int score = checked ? (-VALUE_MATE + ply) : alpha;
-            save_tt(pos, 0, ply, score, static_eval, 0, alpha0, beta, pv_node);
+            save_tt(pos, 0, ply, score, raw_eval, 0, alpha0, beta, pv_node);
             return score;
         }
 
-        save_tt(pos, 0, ply, alpha, static_eval, best_move, alpha0, beta, pv_node);
+        save_tt(pos, 0, ply, alpha, raw_eval, best_move, alpha0, beta, pv_node);
         return alpha;
     }
 
@@ -1149,8 +1381,6 @@ struct Searcher {
 
         if (pos.halfmove_clock >= 100)
             return 0;
-        if (is_threefold_repetition(pos, ply))
-            return repetition_score(pos);
 
         alpha = std::max(alpha, -VALUE_MATE + ply);
         beta = std::min(beta, VALUE_MATE - ply - 1);
@@ -1169,6 +1399,8 @@ struct Searcher {
         const bool pv_node = (beta - alpha) > 1;
         const bool exclusion_search = !move_is_none(excluded_move);
         const memory::TTProbe probe = memory::tt_probe(mem.tt, pos.key);
+        if (is_repetition_draw(pos, ply))
+            return repetition_score(tt_eval_from_probe(probe));
         const Move probed_tt_move = tt_move_from_probe(probe);
         const Move tt_move = exclusion_search ? Move(0) : probed_tt_move;
         const memory::Bound tt_bound = tt_bound_from_probe(probe);
@@ -1187,9 +1419,11 @@ struct Searcher {
             tt_cutoff(probe, search_depth, alpha, beta, ply, tt_score))
             return tt_score;
 
-        const int static_eval = probe.hit ? probe.data.eval : evaluate_position(pos);
-        store_static_eval(ply, static_eval);
         const bool checked = in_check(pos);
+        const StaticEvalInfo eval_info = resolve_static_eval(pos, probe, ply, checked, false);
+        const int raw_eval = eval_info.raw;
+        const int static_eval = eval_info.corrected;
+        store_static_eval(ply, static_eval);
         const bool improving = !checked && improving_position(ply, static_eval);
         const Color side = static_cast<Color>(pos.side_to_move);
         SearchStackEntry& ss = search_stack[ply];
@@ -1282,7 +1516,7 @@ struct Searcher {
                 ++search_obs.nmp_fail_high;
 #endif
                 if (!nmp.requires_verification) {
-                    save_tt(pos, search_depth, ply, score, static_eval, 0, alpha0, beta, pv_node);
+                    save_tt(pos, search_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
                     return score;
                 }
 
@@ -1305,7 +1539,7 @@ struct Searcher {
 #if VALERAIN_SEARCH_OBS
                     ++search_obs.nmp_verified_cutoffs;
 #endif
-                    save_tt(pos, search_depth, ply, score, static_eval, 0, alpha0, beta, pv_node);
+                    save_tt(pos, search_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
                     return score;
                 }
 
@@ -1382,7 +1616,7 @@ struct Searcher {
 #if VALERAIN_SEARCH_OBS
                         ++search_obs.probcut_cutoffs;
 #endif
-                        save_tt(pos, search_depth - 3, ply, score, static_eval, move, alpha0, beta, pv_node);
+                        save_tt(pos, search_depth - 3, ply, score, raw_eval, move, alpha0, beta, pv_node);
                         return score;
                     }
                 }
@@ -1855,7 +2089,7 @@ struct Searcher {
         if (legal_count == 0) {
             const int score = exclusion_search ? alpha : (checked ? (-VALUE_MATE + ply) : 0);
             if (!exclusion_search)
-                save_tt(pos, search_depth, ply, score, static_eval, 0, alpha0, beta, pv_node);
+                save_tt(pos, search_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
             return score;
         }
 
@@ -1893,8 +2127,18 @@ struct Searcher {
             );
         }
 
+        if (!exclusion_search &&
+            !checked &&
+            !cutoff &&
+            best_move != 0 &&
+            alpha > alpha0 &&
+            alpha < beta &&
+            !is_mate_window(alpha)) {
+            update_correction_history(pos, raw_eval, alpha, search_depth);
+        }
+
         if (!exclusion_search)
-            save_tt(pos, search_depth, ply, alpha, static_eval, best_move, alpha0, beta, pv_node);
+            save_tt(pos, search_depth, ply, alpha, raw_eval, best_move, alpha0, beta, pv_node);
         return alpha;
     }
 
@@ -1938,9 +2182,10 @@ struct Searcher {
         const memory::TTProbe probe = memory::tt_probe(mem.tt, root.key);
         const Move tt_move = tt_move_from_probe(probe);
         const Move root_hint = move_is_none(tt_move) ? hint_move : tt_move;
-        const int static_eval = probe.hit ? probe.data.eval : evaluate_position(root);
-        const int alpha0 = alpha;
         const bool checked = in_check(root);
+        const StaticEvalInfo eval_info = resolve_static_eval(root, probe, 0, checked, false);
+        const int raw_eval = eval_info.raw;
+        const int alpha0 = alpha;
 
         ScoredMoveList scored;
         score_moves(root, list, scored, root_hint, 0, depth);
@@ -1996,10 +2241,17 @@ struct Searcher {
         if (best_score == -VALUE_INF)
             best_score = alpha;
 
+        if (!checked &&
+            !is_mate_window(best_score) &&
+            best_score > alpha0 &&
+            best_score < beta) {
+            update_correction_history(root, raw_eval, best_score, depth);
+        }
+
         result.score = best_score;
         result.nodes = nodes;
         result.seldepth = seldepth;
-        save_tt(root, depth, 0, best_score, static_eval, result.best_move, alpha0, beta, true);
+        save_tt(root, depth, 0, best_score, raw_eval, result.best_move, alpha0, beta, true);
         return result;
     }
 };
