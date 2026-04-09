@@ -58,19 +58,18 @@ struct FileHeader {
 
 struct NativeNetwork {
     bool is_loaded = false;
+    bool is_bullet_simple = false;
     std::string loaded_path;
     std::string desc;
     std::string error;
 
     i32 scale = kDefaultScale;
 
-    // First layer: [input][hidden]
     std::array<i16, kInputs * kHidden> w0{};
     std::array<i16, kHidden> b0{};
 
-    // Output layer over dual-perspective hidden activations: [us_hidden | them_hidden]
     std::array<i16, 2 * kHidden> w1{};
-    i32 b1 = 0;
+    i16 b1 = 0;
 };
 
 NativeNetwork g_net{};
@@ -158,6 +157,11 @@ void refresh_hidden(
     }
 }
 
+[[nodiscard]] inline i32 screlu(i32 x) noexcept {
+    const i32 y = std::clamp(x, 0, kClip);
+    return y * y;
+}
+
 [[nodiscard]] int forward(const Position& pos) noexcept {
     alignas(64) i32 us[kHidden];
     alignas(64) i32 them[kHidden];
@@ -168,22 +172,65 @@ void refresh_hidden(
     refresh_hidden(pos, stm, us);
     refresh_hidden(pos, nstm, them);
 
-    i32 sum = g_net.b1;
-    for (int i = 0; i < kHidden; ++i) {
-        const i32 a = std::clamp(us[i],   0, kClip);
-        const i32 b = std::clamp(them[i], 0, kClip);
+    i32 sum = 0;
 
-        sum += static_cast<i32>(g_net.w1[i]) * a;
-        sum += static_cast<i32>(g_net.w1[kHidden + i]) * b;
+    for (int i = 0; i < kHidden; ++i) {
+        sum += static_cast<i32>(g_net.w1[i]) * screlu(us[i]);
+        sum += static_cast<i32>(g_net.w1[kHidden + i]) * screlu(them[i]);
     }
 
-    return static_cast<int>(sum / std::max<i32>(1, g_net.scale));
+    sum /= kClip;                     // divide by QA
+    sum += static_cast<i32>(g_net.b1);
+    sum *= g_net.scale;              // multiply by SCALE
+    sum /= (kClip * 64);             // divide by QA * QB
+
+    return static_cast<int>(sum);
+}
+
+bool load_bullet_simple_quantised(const std::string& path) {
+    unload();
+
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        g_net.error = "cannot open NNUE file: " + path;
+        return false;
+    }
+
+    // Rust layout for simple.rs quantised.bin:
+    // feature_weights: [Accumulator; 768]  where Accumulator = [i16; 128], align 64
+    // feature_bias:    [i16; 128]
+    // output_weights:  [i16; 256]
+    // output_bias:     i16
+    // trailing padding to struct alignment (64 bytes)
+
+    in.read(reinterpret_cast<char*>(g_net.w0.data()), sizeof(g_net.w0));
+    in.read(reinterpret_cast<char*>(g_net.b0.data()), sizeof(g_net.b0));
+    in.read(reinterpret_cast<char*>(g_net.w1.data()), sizeof(g_net.w1));
+    in.read(reinterpret_cast<char*>(&g_net.b1), sizeof(g_net.b1));
+
+    if (!in) {
+        clear_network();
+        g_net.error = "truncated Bullet quantised.bin";
+        return false;
+    }
+
+    // ignore any trailing alignment padding
+    g_net.scale = kDefaultScale;
+    g_net.is_loaded = true;
+    g_net.is_bullet_simple = true;
+    g_net.loaded_path = path;
+    g_net.desc = "Bullet simple quantised NNUE (Chess768 dual-perspective 128x1)";
+    return true;
 }
 
 } // namespace
 
 bool load(const std::string& path) {
     unload();
+
+    if (path.size() >= 4 && path.substr(path.size() - 4) == ".bin") {
+        return load_bullet_simple_quantised(path);
+    }
 
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -232,13 +279,8 @@ bool load(const std::string& path) {
         return false;
     }
 
-    if (in.peek() != std::istream::traits_type::eof()) {
-        clear_network();
-        g_net.error = "unexpected trailing data in NNUE file";
-        return false;
-    }
-
     g_net.is_loaded = true;
+    g_net.is_bullet_simple = false;
     g_net.loaded_path = path;
     g_net.desc = "Valerain native NNUE v1 (Chess768 dual-perspective 128x1)";
     return true;
