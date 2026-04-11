@@ -429,6 +429,20 @@ inline void push_position_history(
     return pos.side_to_move == WHITE ? stm_wr : (1000 - stm_wr);
 }
 
+[[nodiscard]] inline nnue::WdlTriplet white_pov_wdl(
+    const Position& pos,
+    nnue::WdlTriplet stm_wdl
+) noexcept {
+    if (pos.side_to_move == WHITE)
+        return stm_wdl;
+
+    return {
+        .win = stm_wdl.loss,
+        .draw = stm_wdl.draw,
+        .loss = stm_wdl.win
+    };
+}
+
 void handle_setoption(
     memory::Memory& mem,
     bool& use_nnue,
@@ -679,11 +693,11 @@ struct UciSession {
     }
 
     void emit_banner(std::ostream& out) const {
-        out << "Valerain 0.0.7 by the Magnus developer" << std::endl;
+        out << "Valerain 0.0.8 by the Magnus developer" << std::endl;
     }
 
     void emit_uci_id(std::ostream& out) const {
-        out << "id name Valerain 0.0.7\n";
+        out << "id name Valerain 0.0.8\n";
         out << "id author Magnus\n";
         out << "option name Hash type spin default 64 min 1 max 33554432\n";
         out << "option name Clear Hash type button\n";
@@ -729,11 +743,21 @@ struct UciSession {
             const int raw_stm = nnue::eval(pos);
             const int cp_stm = nnue::to_cp(raw_stm, pos);
             const int winrate_stm = nnue::win_rate_model(raw_stm, pos);
+            const int search_stm = nnue::search_score(raw_stm, pos);
+            const int search_cp_stm = nnue::search_score_to_cp(search_stm, pos);
+            const nnue::WdlTriplet wdl_white =
+                white_pov_wdl(pos, nnue::search_score_to_wdl(search_stm, pos));
 
             out << "info string nnue raw " << white_pov_score(pos, raw_stm) << '\n';
             out << "info string nnue cp " << white_pov_score(pos, cp_stm) << '\n';
+            out << "info string nnue search " << white_pov_score(pos, search_stm) << '\n';
+            out << "info string nnue searchcp " << white_pov_score(pos, search_cp_stm) << '\n';
             out << "info string nnue winrate "
                 << white_pov_winrate(pos, winrate_stm) << '\n';
+            out << "info string nnue wdl "
+                << wdl_white.win << ' '
+                << wdl_white.draw << ' '
+                << wdl_white.loss << '\n';
         } else {
             out << "info string nnue unavailable\n";
         }

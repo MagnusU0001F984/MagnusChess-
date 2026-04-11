@@ -164,7 +164,12 @@ constexpr int piece_order_value[PIECE_TYPE_NB] = {
     return victim_value * 32 - attacker_value;
 }
 
-inline void append_uci_score(std::ostream& out, int score) {
+inline void append_uci_score(
+    std::ostream& out,
+    int score,
+    const Position& root,
+    bool nnue_winrate_score
+) {
     if (score >= VALUE_MATE - MAX_PLY) {
         const int plies_to_mate = VALUE_MATE - score;
         out << "score mate " << ((plies_to_mate + 1) / 2);
@@ -177,7 +182,15 @@ inline void append_uci_score(std::ostream& out, int score) {
         return;
     }
 
-    out << "score cp " << score;
+    const int display_score = nnue_winrate_score
+        ? nnue::search_score_to_cp(score, root)
+        : score;
+    out << "score cp " << display_score;
+
+    if (nnue_winrate_score) {
+        const nnue::WdlTriplet wdl = nnue::search_score_to_wdl(score, root);
+        out << " wdl " << wdl.win << ' ' << wdl.draw << ' ' << wdl.loss;
+    }
 }
 
 /*
@@ -920,7 +933,7 @@ struct Searcher {
 
     [[nodiscard]] inline int evaluate_position(const Position& pos) const noexcept {
         if (use_nnue())
-            return nnue::to_cp(nnue::eval(pos), pos);
+            return nnue::search_score(nnue::eval(pos), pos);
         return eval::evaluate(pos);
     }
 
@@ -2538,7 +2551,7 @@ SearchResult iterative_deepening(
 
             *out << "info depth " << depth
                  << " seldepth " << current.seldepth << ' ';
-            append_uci_score(*out, current.score);
+            append_uci_score(*out, current.score, root, searcher.use_nnue());
             *out << " nodes " << total_nodes
                  << " nps " << nps
                  << " hashfull " << cached_hashfull
@@ -2549,6 +2562,11 @@ SearchResult iterative_deepening(
                 *out << ' ' << move_to_uci(searcher.pv_table[0][i]);
 
             *out << '\n';
+            // if (searcher.use_nnue()) {
+            //     *out << "info string winrate "
+            //          << nnue::search_score_to_winrate(current.score, root)
+            //          << '\n';
+            // }
         }
 
         if (stopped_mid_depth)

@@ -27,6 +27,7 @@ SOFTWARE.
 #include <algorithm>
 
 #include "MoveGen.h"
+#include "Nnue.h"
 
 namespace valerain::timeman {
 
@@ -227,7 +228,10 @@ void TimeManager::record_search(
     record.hard_time_ms = std::max(0, limits.hard_time_ms);
     record.elapsed_ms = std::max(0, elapsed_ms);
     record.depth = std::max(0, result.depth);
-    record.score_cp = result.score;
+    record.score_cp =
+        limits.use_nnue && nnue::loaded()
+            ? nnue::search_score_to_cp(result.score, root)
+            : result.score;
     record.best_move = result.best_move;
 
     push_record(record);

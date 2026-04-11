@@ -76,6 +76,38 @@ struct NativeNetwork {
 NativeNetwork g_net{};
 u32 g_generation = 1;
 
+constexpr int kWinRateMaterialMin = 17;
+constexpr int kWinRateMaterialMax = 78;
+constexpr int kCpLookupMaxRaw = 32768;
+constexpr int kMaterialBucketCount = kWinRateMaterialMax - kWinRateMaterialMin + 1;
+constexpr double kWinRateAs[] = {
+    -72.32565836, 185.93832038, -144.58862193, 416.44950446
+};
+constexpr double kWinRateBs[] = {
+    83.86794042, -136.06112997, 69.98820887, 47.62901433
+};
+using CpLookupRow = std::array<i16, kCpLookupMaxRaw + 1>;
+using CpLookupTable = std::array<CpLookupRow, kMaterialBucketCount>;
+
+[[nodiscard]] CpLookupTable build_cp_lookup_table() {
+    CpLookupTable lut{};
+    for (int material = kWinRateMaterialMin; material <= kWinRateMaterialMax; ++material) {
+        const double m = static_cast<double>(material) / 58.0;
+        const double a =
+            (((kWinRateAs[0] * m + kWinRateAs[1]) * m + kWinRateAs[2]) * m)
+            + kWinRateAs[3];
+        auto& row = lut[static_cast<std::size_t>(material - kWinRateMaterialMin)];
+        for (int raw = 0; raw <= kCpLookupMaxRaw; ++raw) {
+            row[static_cast<std::size_t>(raw)] = static_cast<i16>(std::llround(
+                (100.0 * static_cast<double>(raw)) / a
+            ));
+        }
+    }
+    return lut;
+}
+
+const CpLookupTable g_cp_lookup = build_cp_lookup_table();
+
 template<typename T>
 [[nodiscard]] T read_le(std::istream& in) {
     T value{};
@@ -124,6 +156,25 @@ template<typename T>
 
 [[nodiscard]] inline bool accumulator_matches(const Position& pos) noexcept {
     return pos.nnue_acc_valid && pos.nnue_generation == g_generation;
+}
+
+[[nodiscard]] inline int win_rate_material(const Position& pos) noexcept {
+    const int material =
+        std::popcount(pieces(pos, WHITE, PAWN)   | pieces(pos, BLACK, PAWN)) +
+    3 * std::popcount(pieces(pos, WHITE, KNIGHT) | pieces(pos, BLACK, KNIGHT)) +
+    3 * std::popcount(pieces(pos, WHITE, BISHOP) | pieces(pos, BLACK, BISHOP)) +
+    5 * std::popcount(pieces(pos, WHITE, ROOK)   | pieces(pos, BLACK, ROOK)) +
+    9 * std::popcount(pieces(pos, WHITE, QUEEN)  | pieces(pos, BLACK, QUEEN));
+    return std::clamp(material, kWinRateMaterialMin, kWinRateMaterialMax);
+}
+
+[[nodiscard]] inline int lookup_cp(int raw, int material) noexcept {
+    const auto& row =
+        g_cp_lookup[static_cast<std::size_t>(material - kWinRateMaterialMin)];
+    const i64 abs_raw = raw >= 0 ? static_cast<i64>(raw) : -static_cast<i64>(raw);
+    const int index = static_cast<int>(std::min<i64>(abs_raw, kCpLookupMaxRaw));
+    const int cp = static_cast<int>(row[static_cast<std::size_t>(index)]);
+    return raw >= 0 ? cp : -cp;
 }
 
 inline void invalidate_accumulator(Position& pos) noexcept {
@@ -496,32 +547,19 @@ void on_piece_moved(
 }
 
 WinRateParams win_rate_params(const Position& pos) noexcept {
-    const int material =
-        std::popcount(pieces(pos, WHITE, PAWN)   | pieces(pos, BLACK, PAWN)) +
-    3 * std::popcount(pieces(pos, WHITE, KNIGHT) | pieces(pos, BLACK, KNIGHT)) +
-    3 * std::popcount(pieces(pos, WHITE, BISHOP) | pieces(pos, BLACK, BISHOP)) +
-    5 * std::popcount(pieces(pos, WHITE, ROOK)   | pieces(pos, BLACK, ROOK)) +
-    9 * std::popcount(pieces(pos, WHITE, QUEEN)  | pieces(pos, BLACK, QUEEN));
-
-    const double m = std::clamp(material, 17, 78) / 58.0;
-
-    constexpr double as[] = {-72.32565836, 185.93832038, -144.58862193, 416.44950446};
-    constexpr double bs[] = {83.86794042, -136.06112997, 69.98820887, 47.62901433};
-
-    const double a = (((as[0] * m + as[1]) * m + as[2]) * m) + as[3];
-    const double b = (((bs[0] * m + bs[1]) * m + bs[2]) * m) + bs[3];
+    const double m = static_cast<double>(win_rate_material(pos)) / 58.0;
+    const double a =
+        (((kWinRateAs[0] * m + kWinRateAs[1]) * m + kWinRateAs[2]) * m)
+        + kWinRateAs[3];
+    const double b =
+        (((kWinRateBs[0] * m + kWinRateBs[1]) * m + kWinRateBs[2]) * m)
+        + kWinRateBs[3];
 
     return {a, b};
 }
 
 int to_cp(int v, const Position& pos) noexcept {
-    auto [a, b] = win_rate_params(pos);
-    (void)b;
-
-    if (std::abs(a) < 1e-9)
-        return v;
-
-    return static_cast<int>(std::round(100.0 * static_cast<double>(v) / a));
+    return lookup_cp(v, win_rate_material(pos));
 }
 
 int win_rate_model(int v, const Position& pos) noexcept {
@@ -533,6 +571,34 @@ int win_rate_model(int v, const Position& pos) noexcept {
     return static_cast<int>(
         0.5 + 1000.0 / (1.0 + std::exp((a - static_cast<double>(v)) / b))
     );
+}
+
+int search_score(int v, const Position& pos) noexcept {
+    return to_cp(v, pos);
+}
+
+int search_score_to_winrate(int score, const Position& pos) noexcept {
+    auto [a, b] = win_rate_params(pos);
+
+    if (std::abs(a) < 1e-9 || std::abs(b) < 1e-9)
+        return score >= 0 ? 1000 : 0;
+
+    const double raw = (static_cast<double>(score) * a) / 100.0;
+    return std::clamp(win_rate_model(static_cast<int>(std::round(raw)), pos), 0, 1000);
+}
+
+WdlTriplet search_score_to_wdl(int score, const Position& pos) noexcept {
+    const int win = search_score_to_winrate(score, pos);
+    return {
+        .win = win,
+        .draw = 0,
+        .loss = 1000 - win
+    };
+}
+
+int search_score_to_cp(int score, const Position& pos) noexcept {
+    (void)pos;
+    return score;
 }
 
 } // namespace valerain::nnue

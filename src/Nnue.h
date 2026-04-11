@@ -41,6 +41,12 @@ struct WinRateParams {
     double b;
 };
 
+struct WdlTriplet {
+    int win;
+    int draw;
+    int loss;
+};
+
 // Network lifetime management.
 bool load(const std::string& path);
 void unload() noexcept;
@@ -54,6 +60,10 @@ int eval(const Position& pos) noexcept;
 WinRateParams win_rate_params(const Position& pos) noexcept;
 int to_cp(int v, const Position& pos) noexcept;
 int win_rate_model(int v, const Position& pos) noexcept;
+int search_score(int v, const Position& pos) noexcept;
+int search_score_to_cp(int score, const Position& pos) noexcept;
+int search_score_to_winrate(int score, const Position& pos) noexcept;
+WdlTriplet search_score_to_wdl(int score, const Position& pos) noexcept;
 
 // Incremental accumulator hooks wired into Position's board mutators.
 void on_position_cleared(Position& pos) noexcept;

@@ -6,6 +6,7 @@
 *.d
 
 *.nnue
+*.bin
 
 .vscode/
 .idea/
@@ -17,3 +18,4 @@ Thumbs.db
 *.tmp
 *.log
 *.swp
+
