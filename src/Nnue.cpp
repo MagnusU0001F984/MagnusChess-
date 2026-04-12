@@ -159,13 +159,11 @@ template<typename T>
 }
 
 [[nodiscard]] inline int win_rate_material(const Position& pos) noexcept {
-    const int material =
-        std::popcount(pieces(pos, WHITE, PAWN)   | pieces(pos, BLACK, PAWN)) +
-    3 * std::popcount(pieces(pos, WHITE, KNIGHT) | pieces(pos, BLACK, KNIGHT)) +
-    3 * std::popcount(pieces(pos, WHITE, BISHOP) | pieces(pos, BLACK, BISHOP)) +
-    5 * std::popcount(pieces(pos, WHITE, ROOK)   | pieces(pos, BLACK, ROOK)) +
-    9 * std::popcount(pieces(pos, WHITE, QUEEN)  | pieces(pos, BLACK, QUEEN));
-    return std::clamp(material, kWinRateMaterialMin, kWinRateMaterialMax);
+    return std::clamp(
+        valerain::non_king_material(pos),
+        kWinRateMaterialMin,
+        kWinRateMaterialMax
+    );
 }
 
 [[nodiscard]] inline int lookup_cp(int raw, int material) noexcept {
@@ -359,6 +357,88 @@ void clear_network() noexcept {
     return y * y;
 }
 
+#if defined(__AVX2__)
+[[nodiscard]] inline i32 horizontal_sum_epi32_avx2(__m256i v) noexcept {
+    const __m128i lo = _mm256_castsi256_si128(v);
+    const __m128i hi = _mm256_extracti128_si256(v, 1);
+    __m128i sum128 = _mm_add_epi32(lo, hi);
+    sum128 = _mm_hadd_epi32(sum128, sum128);
+    sum128 = _mm_hadd_epi32(sum128, sum128);
+    return _mm_cvtsi128_si32(sum128);
+}
+
+[[nodiscard]] inline __m256i clipped_square_epi32_avx2(
+    __m128i v16
+) noexcept {
+    const __m256i v32 = _mm256_cvtepi16_epi32(v16);
+    return _mm256_mullo_epi32(v32, v32);
+}
+
+[[nodiscard]] inline __m256i load_weights_epi32_avx2(
+    const i16* weights
+) noexcept {
+    const __m128i w16 =
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights));
+    return _mm256_cvtepi16_epi32(w16);
+}
+
+[[nodiscard]] inline i32 forward_dot_avx2(
+    const std::array<i16, kHidden>& us,
+    const std::array<i16, kHidden>& them
+) noexcept {
+    const i16* us_ptr = us.data();
+    const i16* them_ptr = them.data();
+    const i16* w_us_ptr = g_net.w1.data();
+    const i16* w_them_ptr = g_net.w1.data() + kHidden;
+
+    const __m256i vzero = _mm256_setzero_si256();
+    const __m256i vclip = _mm256_set1_epi16(static_cast<i16>(kClip));
+    __m256i sum_us = _mm256_setzero_si256();
+    __m256i sum_them = _mm256_setzero_si256();
+
+    int i = 0;
+    for (; i + 15 < kHidden; i += 16) {
+        const __m256i us16 =
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(us_ptr + i));
+        const __m256i them16 =
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(them_ptr + i));
+
+        const __m256i clipped_us =
+            _mm256_min_epi16(_mm256_max_epi16(us16, vzero), vclip);
+        const __m256i clipped_them =
+            _mm256_min_epi16(_mm256_max_epi16(them16, vzero), vclip);
+
+        const __m128i us_lo = _mm256_castsi256_si128(clipped_us);
+        const __m128i us_hi = _mm256_extracti128_si256(clipped_us, 1);
+        const __m128i them_lo = _mm256_castsi256_si128(clipped_them);
+        const __m128i them_hi = _mm256_extracti128_si256(clipped_them, 1);
+
+        const __m256i sq_us_lo = clipped_square_epi32_avx2(us_lo);
+        const __m256i sq_us_hi = clipped_square_epi32_avx2(us_hi);
+        const __m256i sq_them_lo = clipped_square_epi32_avx2(them_lo);
+        const __m256i sq_them_hi = clipped_square_epi32_avx2(them_hi);
+
+        const __m256i w_us_lo = load_weights_epi32_avx2(w_us_ptr + i);
+        const __m256i w_us_hi = load_weights_epi32_avx2(w_us_ptr + i + 8);
+        const __m256i w_them_lo = load_weights_epi32_avx2(w_them_ptr + i);
+        const __m256i w_them_hi = load_weights_epi32_avx2(w_them_ptr + i + 8);
+
+        sum_us = _mm256_add_epi32(sum_us, _mm256_mullo_epi32(w_us_lo, sq_us_lo));
+        sum_us = _mm256_add_epi32(sum_us, _mm256_mullo_epi32(w_us_hi, sq_us_hi));
+        sum_them = _mm256_add_epi32(sum_them, _mm256_mullo_epi32(w_them_lo, sq_them_lo));
+        sum_them = _mm256_add_epi32(sum_them, _mm256_mullo_epi32(w_them_hi, sq_them_hi));
+    }
+
+    i32 sum = horizontal_sum_epi32_avx2(_mm256_add_epi32(sum_us, sum_them));
+    for (; i < kHidden; ++i) {
+        sum += static_cast<i32>(w_us_ptr[i]) * screlu(static_cast<i32>(us_ptr[i]));
+        sum += static_cast<i32>(w_them_ptr[i]) * screlu(static_cast<i32>(them_ptr[i]));
+    }
+
+    return sum;
+}
+#endif
+
 [[nodiscard]] int forward(const Position& pos) noexcept {
     const Color stm = static_cast<Color>(pos.side_to_move);
     const Color nstm = opposite(stm);
@@ -367,10 +447,14 @@ void clear_network() noexcept {
     const auto& them = pos.nnue_acc[nstm];
     i32 sum = 0;
 
+#if defined(__AVX2__)
+    sum = forward_dot_avx2(us, them);
+#else
     for (int i = 0; i < kHidden; ++i) {
         sum += static_cast<i32>(g_net.w1[i]) * screlu(static_cast<i32>(us[i]));
         sum += static_cast<i32>(g_net.w1[kHidden + i]) * screlu(static_cast<i32>(them[i]));
     }
+#endif
 
     sum /= kClip;                     // divide by QA
     sum += static_cast<i32>(g_net.b1);

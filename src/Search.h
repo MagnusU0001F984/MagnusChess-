@@ -56,7 +56,12 @@ struct SearchLimits {
     int game_history_count = 0;
     Move root_moves[256]{};
     int root_move_count = 0;
-    const std::atomic<bool>* stop = nullptr;
+    std::atomic<bool>* stop = nullptr;
+    const std::atomic<bool>* external_stop = nullptr;
+    std::atomic<u64>* shared_nodes = nullptr;
+    int thread_id = 0;
+    int thread_count = 1;
+    bool report_info = true;
 };
 
 struct SearchResult {

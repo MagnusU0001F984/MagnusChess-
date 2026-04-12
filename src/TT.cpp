@@ -41,12 +41,30 @@ namespace {
     return static_cast<u32>(key >> 32);
 }
 
+template <typename T>
+[[nodiscard]] inline T tt_atomic_load(
+    const T& value,
+    std::memory_order order = std::memory_order_relaxed
+) noexcept {
+    return std::atomic_ref<T>(const_cast<T&>(value)).load(order);
+}
+
+template <typename T>
+inline void tt_atomic_store(
+    T& value,
+    T desired,
+    std::memory_order order = std::memory_order_relaxed
+) noexcept {
+    std::atomic_ref<T>(value).store(desired, order);
+}
+
 [[nodiscard]] inline int lane_mask4_eq_u32_sse(const u32* ptr, u32 tag32) noexcept {
-    // Compare the four lane tags in parallel and return a 4-bit match mask.
-    const __m128i tags = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ptr));
-    const __m128i want = _mm_set1_epi32(static_cast<int>(tag32));
-    const __m128i cmp  = _mm_cmpeq_epi32(tags, want);
-    return _mm_movemask_ps(_mm_castsi128_ps(cmp));
+    int mask = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (tt_atomic_load(ptr[lane], std::memory_order_acquire) == tag32)
+            mask |= (1 << lane);
+    }
+    return mask;
 }
 
 [[nodiscard]] inline int first_lane_from_mask4(int mask) noexcept {
@@ -60,25 +78,22 @@ namespace {
 }
 
 [[nodiscard]] inline int empty_lane_mask4_u8(const u8* ages) noexcept {
-    u32 x = 0;
-    std::memcpy(&x, ages, sizeof(x));
-
-    const u32 z = (x - 0x01010101u) & ~x & 0x80808080u;
-
-    return ((z >> 7)  & 0x1)
-         | (((z >> 15) & 0x1) << 1)
-         | (((z >> 23) & 0x1) << 2)
-         | (((z >> 31) & 0x1) << 3);
+    int mask = 0;
+    for (int lane = 0; lane < 4; ++lane) {
+        if (tt_atomic_load(ages[lane], std::memory_order_relaxed) == 0)
+            mask |= (1 << lane);
+    }
+    return mask;
 }
 
 [[nodiscard]] inline int first_live_match_lane4(
     const TTCluster& c,
     int tag_mask
 ) noexcept {
-    if ((tag_mask & 0x1) && c.age[0] != 0) return 0;
-    if ((tag_mask & 0x2) && c.age[1] != 0) return 1;
-    if ((tag_mask & 0x4) && c.age[2] != 0) return 2;
-    if ((tag_mask & 0x8) && c.age[3] != 0) return 3;
+    if ((tag_mask & 0x1) && tt_atomic_load(c.age[0], std::memory_order_relaxed) != 0) return 0;
+    if ((tag_mask & 0x2) && tt_atomic_load(c.age[1], std::memory_order_relaxed) != 0) return 1;
+    if ((tag_mask & 0x4) && tt_atomic_load(c.age[2], std::memory_order_relaxed) != 0) return 2;
+    if ((tag_mask & 0x8) && tt_atomic_load(c.age[3], std::memory_order_relaxed) != 0) return 3;
     return -1;
 }
 
@@ -88,11 +103,14 @@ namespace {
     u8 current_age
 ) noexcept {
     // Deeper, newer, exact, and PV entries are more expensive to overwrite.
-    const int age_penalty = static_cast<int>(static_cast<u8>(current_age - c.age[lane]));
-    const int exact_bonus = ((c.flags[lane] & 0x3U) == BOUND_EXACT) ? 8 : 0;
-    const int pv_bonus    = (c.flags[lane] & 0x4U) ? 4 : 0;
+    const u8 lane_age = tt_atomic_load(c.age[lane], std::memory_order_relaxed);
+    const u8 lane_flags = tt_atomic_load(c.flags[lane], std::memory_order_relaxed);
+    const i16 lane_depth = tt_atomic_load(c.depth[lane], std::memory_order_relaxed);
+    const int age_penalty = static_cast<int>(static_cast<u8>(current_age - lane_age));
+    const int exact_bonus = ((lane_flags & 0x3U) == BOUND_EXACT) ? 8 : 0;
+    const int pv_bonus    = (lane_flags & 0x4U) ? 4 : 0;
 
-    return static_cast<int>(c.depth[lane]) - age_penalty * 2 + exact_bonus + pv_bonus;
+    return static_cast<int>(lane_depth) - age_penalty * 2 + exact_bonus + pv_bonus;
 }
 
 [[nodiscard]] inline int best_replacement_lane4(
@@ -136,34 +154,45 @@ namespace {
 
 TTData tt_cluster_load(const TTCluster& c, int lane) noexcept {
     TTData d;
-    d.tag32 = c.tag32[lane];
-    d.move  = c.move[lane];
-    d.score = c.score[lane];
-    d.eval  = c.eval[lane];
-    d.depth = c.depth[lane];
-    d.age   = c.age[lane];
-    d.flags = c.flags[lane];
-    d.spare = c.spare[lane];
+    d.tag32 = tt_atomic_load(c.tag32[lane], std::memory_order_acquire);
+    d.move  = tt_atomic_load(c.move[lane], std::memory_order_relaxed);
+    d.score = tt_atomic_load(c.score[lane], std::memory_order_relaxed);
+    d.eval  = tt_atomic_load(c.eval[lane], std::memory_order_relaxed);
+    d.depth = tt_atomic_load(c.depth[lane], std::memory_order_relaxed);
+    d.age   = tt_atomic_load(c.age[lane], std::memory_order_relaxed);
+    d.flags = tt_atomic_load(c.flags[lane], std::memory_order_relaxed);
+    d.spare = tt_atomic_load(c.spare[lane], std::memory_order_relaxed);
     return d;
 }
 
 void tt_cluster_store(TTCluster& c, int lane, const TTData& d) noexcept {
-    c.move[lane]  = d.move;
-    c.score[lane] = d.score;
-    c.eval[lane]  = d.eval;
-    c.depth[lane] = d.depth;
-    c.age[lane]   = d.age;
-    c.flags[lane] = d.flags;
-    c.spare[lane] = d.spare;
-    c.tag32[lane] = d.tag32;
+    // Publish by tag: invalidate the slot, write payload, then publish tag.
+    tt_atomic_store(c.tag32[lane], 0U, std::memory_order_relaxed);
+    tt_atomic_store(c.move[lane], d.move, std::memory_order_relaxed);
+    tt_atomic_store(c.score[lane], d.score, std::memory_order_relaxed);
+    tt_atomic_store(c.eval[lane], d.eval, std::memory_order_relaxed);
+    tt_atomic_store(c.depth[lane], d.depth, std::memory_order_relaxed);
+    tt_atomic_store(c.age[lane], d.age, std::memory_order_relaxed);
+    tt_atomic_store(c.flags[lane], d.flags, std::memory_order_relaxed);
+    tt_atomic_store(c.spare[lane], d.spare, std::memory_order_relaxed);
+    tt_atomic_store(c.tag32[lane], d.tag32, std::memory_order_release);
 }
 
 void tt_cluster_clear(TTCluster& c) noexcept {
-    std::memset(&c, 0, sizeof(TTCluster));
+    for (int lane = 0; lane < 4; ++lane) {
+        tt_atomic_store(c.tag32[lane], 0U, std::memory_order_relaxed);
+        tt_atomic_store(c.move[lane], static_cast<u16>(0), std::memory_order_relaxed);
+        tt_atomic_store(c.score[lane], static_cast<i16>(0), std::memory_order_relaxed);
+        tt_atomic_store(c.eval[lane], static_cast<i16>(0), std::memory_order_relaxed);
+        tt_atomic_store(c.depth[lane], static_cast<i16>(0), std::memory_order_relaxed);
+        tt_atomic_store(c.age[lane], static_cast<u8>(0), std::memory_order_relaxed);
+        tt_atomic_store(c.flags[lane], static_cast<u8>(0), std::memory_order_relaxed);
+        tt_atomic_store(c.spare[lane], static_cast<u16>(0), std::memory_order_relaxed);
+    }
 }
 
 int tt_replacement_score(const TTCluster& c, int lane, u8 current_age) noexcept {
-    if (c.age[lane] == 0)
+    if (tt_atomic_load(c.age[lane], std::memory_order_relaxed) == 0)
         return -1000000000;
 
     return replacement_score_lane(c, lane, current_age);
@@ -171,15 +200,20 @@ int tt_replacement_score(const TTCluster& c, int lane, u8 current_age) noexcept 
 
 void tt_free(TT& tt) noexcept {
     delete[] tt.clusters;
+    delete[] tt.locks;
     tt.clusters = nullptr;
     tt.cluster_count = 0;
     tt.cluster_mask = 0;
+    tt.locks = nullptr;
+    tt.lock_count = 0;
+    tt.lock_mask = 0;
     tt.generation = 1;
 }
 
 void tt_clear(TT& tt) noexcept {
     if (!tt.clusters) return;
-    std::memset(tt.clusters, 0, sizeof(TTCluster) * tt.cluster_count);
+    for (std::size_t i = 0; i < tt.cluster_count; ++i)
+        tt_cluster_clear(tt.clusters[i]);
     tt.generation = 1;
 }
 
@@ -229,12 +263,24 @@ TTProbe tt_probe(TT& tt, Key key) noexcept {
 
     const int tag_mask = lane_mask4_eq_u32_sse(c.tag32, tag32);
     if (tag_mask) {
-        const int hit_lane = first_live_match_lane4(c, tag_mask);
-        if (hit_lane >= 0) {
+        for (int lane = 0; lane < 4; ++lane) {
+            if (((tag_mask >> lane) & 1) == 0)
+                continue;
+
+            if (tt_atomic_load(c.tag32[lane], std::memory_order_acquire) != tag32)
+                continue;
+
+            TTData data = tt_cluster_load(c, lane);
+            if (data.age == 0)
+                continue;
+
+            if (tt_atomic_load(c.tag32[lane], std::memory_order_acquire) != tag32)
+                continue;
+
             res.hit = true;
             res.slot.cluster = &c;
-            res.slot.lane = hit_lane;
-            res.data = tt_cluster_load(c, hit_lane);
+            res.slot.lane = lane;
+            res.data = data;
             return res;
         }
     }
@@ -316,8 +362,9 @@ int tt_hashfull(const TT& tt, int max_age) noexcept {
     for (int i = 0; i < n; ++i) {
         const TTCluster& c = tt.clusters[i];
         for (int lane = 0; lane < 4; ++lane) {
-            used += c.age[lane] != 0
-                && tt_relative_age(tt.generation, c.age[lane]) <= max_age;
+            const u8 age = tt_atomic_load(c.age[lane], std::memory_order_relaxed);
+            used += age != 0
+                && tt_relative_age(tt.generation, age) <= max_age;
         }
     }
 

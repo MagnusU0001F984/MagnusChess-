@@ -27,8 +27,13 @@ SOFTWARE.
 #include <algorithm>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "Evaluation.h"
 #include "History.h"
@@ -137,7 +142,6 @@ constexpr SeeScalePreset SEE_TERM_PRESET = SeeScalePreset::Strong;
 #endif
 
 #ifndef VALERAIN_CAPTURE_OBS
-// #define VALERAIN_CAPTURE_OBS 1
 #define VALERAIN_CAPTURE_OBS 0
 #endif
 
@@ -146,7 +150,7 @@ constexpr SeeScalePreset SEE_TERM_PRESET = SeeScalePreset::Strong;
 #endif
 
 #ifndef VALERAIN_MOVEPICKER_OBS
-#define VALERAIN_MOVEPICKER_OBS 1
+#define VALERAIN_MOVEPICKER_OBS 0
 #endif
 
 constexpr int piece_order_value[PIECE_TYPE_NB] = {
@@ -218,6 +222,7 @@ struct Searcher {
 
     u64 nodes = 0;
     u64 base_nodes = 0;
+    u64 published_nodes = 0;
     int seldepth = 0;
     HistoryTables history_tables{};
     Move pv_table[MAX_PLY][MAX_PLY]{};
@@ -845,7 +850,23 @@ struct Searcher {
     }
 
     [[nodiscard]] inline u64 global_nodes() const noexcept {
+        if (limits.shared_nodes != nullptr) {
+            return limits.shared_nodes->load(std::memory_order_relaxed)
+                + (nodes - published_nodes);
+        }
         return base_nodes + nodes;
+    }
+
+    inline void publish_nodes() noexcept {
+        if (limits.shared_nodes == nullptr)
+            return;
+
+        const u64 delta = nodes - published_nodes;
+        if (delta == 0)
+            return;
+
+        limits.shared_nodes->fetch_add(delta, std::memory_order_relaxed);
+        published_nodes = nodes;
     }
 
     inline void update_seldepth(int ply) noexcept {
@@ -862,6 +883,13 @@ struct Searcher {
     [[nodiscard]] inline bool hit_hard_limit() noexcept {
         if (stopped)
             return true;
+
+        if (limits.external_stop != nullptr &&
+            limits.external_stop->load(std::memory_order_relaxed)) {
+            stopped = true;
+            hard_stop = true;
+            return true;
+        }
 
         if (limits.stop != nullptr &&
             limits.stop->load(std::memory_order_relaxed)) {
@@ -888,8 +916,10 @@ struct Searcher {
     }
 
     inline void poll_limits() noexcept {
-        if ((nodes & 1023ULL) == 0)
+        if ((nodes & 1023ULL) == 0) {
+            publish_nodes();
             (void)hit_hard_limit();
+        }
     }
 
     [[nodiscard]] inline bool stop_after_completed_depth() noexcept {
@@ -947,14 +977,6 @@ struct Searcher {
         return static_cast<std::size_t>(mix64(key)) & (CORRECTION_HISTORY_SIZE - 1);
     }
 
-    [[nodiscard]] static inline int packed_piece_count(
-        const Position& pos,
-        Color color,
-        PieceType piece_type
-    ) noexcept {
-        return std::popcount(static_cast<u64>(pieces(pos, color, piece_type)));
-    }
-
     [[nodiscard]] CorrectionKeys correction_keys(const Position& pos) const noexcept {
         CorrectionKeys keys{};
         keys.position = pos.key;
@@ -963,20 +985,7 @@ struct Searcher {
             ^ std::rotl(pieces(pos, BLACK, PAWN), 7)
             ^ std::rotl(pieces(pos, WHITE, KING), 19)
             ^ std::rotl(pieces(pos, BLACK, KING), 29);
-
-        u64 material = 0;
-        int shift = 0;
-        constexpr PieceType material_piece_types[] = {
-            PAWN, KNIGHT, BISHOP, ROOK, QUEEN
-        };
-        for (int color = WHITE; color <= BLACK; ++color) {
-            const Color piece_color = static_cast<Color>(color);
-            for (PieceType piece_type : material_piece_types) {
-                material |= static_cast<u64>(packed_piece_count(pos, piece_color, piece_type)) << shift;
-                shift += 4;
-            }
-        }
-        keys.material = material;
+        keys.material = packed_material_signature(pos);
         return keys;
     }
 
@@ -2300,8 +2309,48 @@ struct Searcher {
         return alpha;
     }
 
+    struct RootMoveResult {
+        int score = -VALUE_INF;
+        bool improved_alpha = false;
+    };
+
+    [[nodiscard]] RootMoveResult search_root_move(
+        const Position& root,
+        Move move,
+        int depth,
+        int alpha,
+        int beta,
+        bool full_window
+    ) noexcept {
+        const int alpha_before = alpha;
+        Position local_root = root;
+
+        StateInfo st;
+        make_move(local_root, move, mem.tables, st);
+        memory::tt_prefetch(mem.tt, local_root.key);
+        move_stack[0] = move;
+
+        int score = 0;
+        if (full_window) {
+            score = -pvs(local_root, depth - 1, -beta, -alpha, 1, true);
+        } else {
+            score = -pvs(local_root, depth - 1, -alpha - 1, -alpha, 1, true);
+            if (score > alpha)
+                score = -pvs(local_root, depth - 1, -beta, -alpha, 1, true);
+        }
+
+        unmake_move(local_root, move, mem.tables, st);
+
+        RootMoveResult result;
+        result.score = score;
+        result.improved_alpha = score > alpha_before;
+        if (result.improved_alpha)
+            update_pv(0, move);
+        return result;
+    }
+
     [[nodiscard]] SearchResult search_root(
-        Position root,
+        const Position& root,
         int depth,
         Move hint_move,
         int alpha,
@@ -2313,11 +2362,8 @@ struct Searcher {
         update_seldepth(0);
         rep_keys[0] = root.key;
 
-        MoveList list;
-        GenInfo info;
-        init_gen_info(info, root, mem);
-        Move* rend = generate_pseudo_legal(root, mem, info, list.moves);
-        list.size = static_cast<int>(rend - list.moves);
+        MoveList list{};
+        generate_legal(root, mem, list);
 
         if (limits.root_move_count > 0) {
             MoveList filtered;
@@ -2348,7 +2394,6 @@ struct Searcher {
         ScoredMoveList scored;
         score_moves(root, list, scored, root_hint, 0, depth);
         int best_score = -VALUE_INF;
-        int legal_count = 0;
         result.best_move = 0;
 
         for (int i = 0; i < scored.size; ++i) {
@@ -2356,40 +2401,23 @@ struct Searcher {
                 break;
 
             const Move move = pick_next(scored, i);
-            if (!legal_fast(root, mem, info, move))
-                continue;
-
-            ++legal_count;
-            StateInfo st;
-            make_move(root, move, mem.tables, st);
-            memory::tt_prefetch(mem.tt, root.key);
-            move_stack[0] = move;
-
-            int score = 0;
-            if (i == 0) {
-                score = -pvs(root, depth - 1, -beta, -alpha, 1, true);
-            } else {
-                score = -pvs(root, depth - 1, -alpha - 1, -alpha, 1, true);
-                if (score > alpha)
-                    score = -pvs(root, depth - 1, -beta, -alpha, 1, true);
-            }
-
-            unmake_move(root, move, mem.tables, st);
+            const RootMoveResult move_result =
+                search_root_move(root, move, depth, alpha, beta, i == 0);
+            const int score = move_result.score;
 
             if (score > best_score) {
                 best_score = score;
                 result.best_move = move;
             }
 
-            if (score > alpha) {
+            if (move_result.improved_alpha) {
                 alpha = score;
-                update_pv(0, move);
                 if (alpha >= beta)
                     break;
             }
         }
 
-        if (legal_count == 0) {
+        if (result.best_move == 0) {
             result.score = checked ? -VALUE_MATE : 0;
             result.best_move = 0;
             result.seldepth = seldepth;
@@ -2420,6 +2448,527 @@ struct Searcher {
     }
 };
 
+struct OrderedRootSearch {
+    std::vector<Move> ordered_moves;
+    memory::TTProbe probe{};
+    Move root_hint = 0;
+    Searcher::StaticEvalInfo eval_info{};
+    bool checked = false;
+};
+
+struct RootParallelTask {
+    const Position* root = nullptr;
+    const std::vector<Move>* ordered_moves = nullptr;
+    int depth = 0;
+    int alpha0 = -VALUE_INF;
+    int beta = VALUE_INF;
+    int block_size = 2;
+    Searcher::clock::time_point start_time{};
+    std::atomic<int> next_index{0};
+    std::atomic<int> shared_alpha{0};
+    std::atomic<bool> cutoff{false};
+    std::mutex result_mutex;
+    SearchResult best{};
+    Move best_pv[MAX_PLY]{};
+    int best_pv_length = 0;
+    int max_seldepth = 0;
+
+    void submit(
+        Searcher& searcher,
+        Move move,
+        const Searcher::RootMoveResult& outcome
+    ) noexcept {
+        if (outcome.improved_alpha) {
+            int observed = shared_alpha.load(std::memory_order_relaxed);
+            while (outcome.score > observed &&
+                   !shared_alpha.compare_exchange_weak(
+                       observed,
+                       outcome.score,
+                       std::memory_order_relaxed,
+                       std::memory_order_relaxed
+                   )) {
+            }
+        }
+
+        std::scoped_lock lock(result_mutex);
+        max_seldepth = std::max(max_seldepth, searcher.seldepth);
+
+        if (best.best_move == 0 || outcome.score > best.score) {
+            best.best_move = move;
+            best.score = outcome.score;
+            best.depth = depth;
+            best.seldepth = searcher.seldepth;
+            if (outcome.improved_alpha) {
+                best_pv_length = searcher.pv_length[0];
+                for (int i = 0; i < best_pv_length; ++i)
+                    best_pv[i] = searcher.pv_table[0][i];
+            } else {
+                best_pv_length = 1;
+                best_pv[0] = move;
+            }
+        }
+
+        if (outcome.score >= beta)
+            cutoff.store(true, std::memory_order_relaxed);
+    }
+};
+
+struct RootWorker {
+    SearchLimits limits;
+    Searcher searcher;
+
+    explicit RootWorker(memory::Memory& mem, const SearchLimits& base_limits)
+        : limits(base_limits), searcher(mem, limits) {}
+};
+
+void reset_searcher_iteration(
+    Searcher& searcher,
+    Searcher::clock::time_point start_time,
+    u64 base_nodes
+) noexcept;
+
+void search_root_blocks(Searcher& searcher, RootParallelTask& task) noexcept;
+
+struct RootThreadPool {
+    std::mutex mutex;
+    std::condition_variable work_cv;
+    std::condition_variable done_cv;
+    std::vector<std::unique_ptr<RootWorker>> workers;
+    std::vector<std::thread> threads;
+    RootParallelTask* active_task = nullptr;
+    Searcher::clock::time_point task_start_time{};
+    u64 task_base_nodes = 0;
+    int generation = 0;
+    int active_worker_count = 0;
+    int pending_workers = 0;
+    bool shutting_down = false;
+
+    RootThreadPool(memory::Memory& mem, const SearchLimits& base_limits) {
+        const int helper_count = std::max(0, base_limits.thread_count - 1);
+        workers.reserve(static_cast<std::size_t>(helper_count));
+        threads.reserve(static_cast<std::size_t>(helper_count));
+
+        for (int i = 0; i < helper_count; ++i) {
+            auto worker = std::make_unique<RootWorker>(mem, base_limits);
+            worker->limits.thread_id = i + 1;
+            worker->limits.thread_count = base_limits.thread_count;
+            worker->limits.report_info = false;
+            worker->limits.shared_nodes = nullptr;
+            workers.push_back(std::move(worker));
+        }
+
+        for (int i = 0; i < helper_count; ++i) {
+            threads.emplace_back([this, i]() noexcept {
+                run_worker(i);
+            });
+        }
+    }
+
+    ~RootThreadPool() {
+        {
+            std::scoped_lock lock(mutex);
+            shutting_down = true;
+            ++generation;
+        }
+        work_cv.notify_all();
+
+        for (std::thread& thread : threads) {
+            if (thread.joinable())
+                thread.join();
+        }
+    }
+
+    [[nodiscard]] int helper_capacity() const noexcept {
+        return static_cast<int>(workers.size());
+    }
+
+    void dispatch(
+        RootParallelTask& task,
+        Searcher::clock::time_point start_time,
+        u64 base_nodes,
+        std::atomic<u64>* shared_nodes,
+        int worker_count
+    ) {
+        if (worker_count <= 0)
+            return;
+
+        {
+            std::scoped_lock lock(mutex);
+            active_task = &task;
+            task_start_time = start_time;
+            task_base_nodes = base_nodes;
+            active_worker_count = std::min(worker_count, helper_capacity());
+            pending_workers = active_worker_count;
+
+            for (int i = 0; i < active_worker_count; ++i)
+                workers[static_cast<std::size_t>(i)]->limits.shared_nodes = shared_nodes;
+
+            for (int i = active_worker_count; i < helper_capacity(); ++i)
+                workers[static_cast<std::size_t>(i)]->limits.shared_nodes = nullptr;
+
+            ++generation;
+        }
+
+        work_cv.notify_all();
+    }
+
+    void wait() {
+        std::unique_lock lock(mutex);
+        done_cv.wait(lock, [this]() noexcept {
+            return pending_workers == 0;
+        });
+        active_task = nullptr;
+        active_worker_count = 0;
+
+        for (auto& worker : workers)
+            worker->limits.shared_nodes = nullptr;
+    }
+
+private:
+    void run_worker(int worker_index) noexcept {
+        RootWorker& worker = *workers[static_cast<std::size_t>(worker_index)];
+        int seen_generation = 0;
+
+        for (;;) {
+            RootParallelTask* task = nullptr;
+            Searcher::clock::time_point start_time{};
+            u64 base_nodes = 0;
+
+            {
+                std::unique_lock lock(mutex);
+                work_cv.wait(lock, [this, seen_generation]() noexcept {
+                    return shutting_down || generation != seen_generation;
+                });
+
+                if (shutting_down)
+                    return;
+
+                seen_generation = generation;
+                if (worker_index >= active_worker_count)
+                    continue;
+
+                task = active_task;
+                start_time = task_start_time;
+                base_nodes = task_base_nodes;
+            }
+
+            if (task != nullptr) {
+                reset_searcher_iteration(worker.searcher, start_time, base_nodes);
+                search_root_blocks(worker.searcher, *task);
+            }
+
+            {
+                std::scoped_lock lock(mutex);
+                if (pending_workers > 0 && --pending_workers == 0)
+                    done_cv.notify_one();
+            }
+        }
+    }
+};
+
+void reset_searcher_iteration(
+    Searcher& searcher,
+    Searcher::clock::time_point start_time,
+    u64 base_nodes
+) noexcept {
+    searcher.nodes = 0;
+    searcher.base_nodes = base_nodes;
+    searcher.published_nodes = 0;
+    searcher.seldepth = 0;
+    searcher.nmp_min_ply = 0;
+    searcher.stopped = false;
+    searcher.hard_stop = false;
+    searcher.start_time = start_time;
+    std::fill(std::begin(searcher.pv_length), std::end(searcher.pv_length), 0);
+    std::fill(std::begin(searcher.move_stack), std::end(searcher.move_stack), Move(0));
+    std::fill(
+        std::begin(searcher.search_stack),
+        std::end(searcher.search_stack),
+        SearchStackEntry{}
+    );
+    std::fill(
+        std::begin(searcher.static_eval_valid),
+        std::end(searcher.static_eval_valid),
+        false
+    );
+}
+
+[[nodiscard]] int choose_root_seed_count(
+    std::size_t root_count,
+    int thread_count
+) noexcept {
+    if (root_count > 1 && root_count <= static_cast<std::size_t>(thread_count))
+        return 2;
+    return 1;
+}
+
+[[nodiscard]] int choose_root_block_size(
+    std::size_t root_count,
+    int thread_count
+) noexcept {
+    if (root_count <= 8)
+        return 1;
+    if (root_count >= 24 && thread_count >= 8)
+        return 4;
+    return 2;
+}
+
+[[nodiscard]] int choose_active_root_helpers(
+    int remaining_moves,
+    int block_size,
+    int helper_capacity
+) noexcept {
+    if (remaining_moves <= 0 || helper_capacity <= 0)
+        return 0;
+
+    const int block_count = (remaining_moves + block_size - 1) / block_size;
+    return std::min(helper_capacity, std::max(0, block_count - 1));
+}
+
+[[nodiscard]] bool use_root_aspiration(
+    const SearchLimits& limits,
+    int depth
+) noexcept {
+    (void)limits;
+    return depth >= 2;
+}
+
+[[nodiscard]] OrderedRootSearch prepare_ordered_root_search(
+    Searcher& searcher,
+    const Position& root,
+    Move hint_move,
+    int depth
+) noexcept {
+    OrderedRootSearch prep;
+    prep.probe = memory::tt_probe(searcher.mem.tt, root.key);
+    const Move tt_move = searcher.tt_move_from_probe(prep.probe);
+    prep.root_hint = move_is_none(tt_move) ? hint_move : tt_move;
+    prep.checked = searcher.in_check(root);
+    prep.eval_info = searcher.resolve_static_eval(root, prep.probe, 0, prep.checked, false);
+
+    MoveList list{};
+    generate_legal(root, searcher.mem, list);
+
+    if (searcher.limits.root_move_count > 0) {
+        MoveList filtered{};
+        for (int i = 0; i < list.size; ++i) {
+            const Move move = list.moves[i];
+            bool allowed = false;
+            for (int j = 0; j < searcher.limits.root_move_count; ++j) {
+                if (searcher.limits.root_moves[j] == move) {
+                    allowed = true;
+                    break;
+                }
+            }
+            if (allowed)
+                filtered.moves[filtered.size++] = move;
+        }
+        list = filtered;
+    }
+
+    if (list.size == 0)
+        return prep;
+
+    ScoredMoveList scored;
+    searcher.score_moves(root, list, scored, prep.root_hint, 0, depth);
+    prep.ordered_moves.reserve(static_cast<std::size_t>(scored.size));
+    for (int i = 0; i < scored.size; ++i)
+        prep.ordered_moves.push_back(searcher.pick_next(scored, i));
+
+    return prep;
+}
+
+void search_root_blocks(Searcher& searcher, RootParallelTask& task) noexcept {
+    for (;;) {
+        if (task.cutoff.load(std::memory_order_relaxed) || searcher.hit_hard_limit())
+            break;
+
+        const int start =
+            task.next_index.fetch_add(task.block_size, std::memory_order_relaxed);
+        if (start >= static_cast<int>(task.ordered_moves->size()))
+            break;
+
+        const int end = std::min(
+            start + task.block_size,
+            static_cast<int>(task.ordered_moves->size())
+        );
+        int local_alpha = task.shared_alpha.load(std::memory_order_relaxed);
+
+        for (int i = start; i < end; ++i) {
+            if (task.cutoff.load(std::memory_order_relaxed) || searcher.hit_hard_limit())
+                break;
+
+            const Move move = (*task.ordered_moves)[i];
+            const Searcher::RootMoveResult outcome =
+                searcher.search_root_move(*task.root, move, task.depth, local_alpha, task.beta, false);
+            if (outcome.improved_alpha)
+                local_alpha = outcome.score;
+            task.submit(searcher, move, outcome);
+        }
+    }
+
+    searcher.publish_nodes();
+}
+
+[[nodiscard]] SearchResult finalize_parallel_root(
+    Searcher& searcher,
+    const OrderedRootSearch& prep,
+    RootParallelTask& task,
+    const Position& root,
+    u64 attempt_base_nodes
+) noexcept {
+    SearchResult result = task.best;
+    result.nodes = searcher.limits.shared_nodes != nullptr
+        ? searcher.limits.shared_nodes->load(std::memory_order_relaxed) - attempt_base_nodes
+        : searcher.nodes;
+    result.seldepth = task.max_seldepth;
+
+    searcher.seldepth = std::max(searcher.seldepth, task.max_seldepth);
+    searcher.pv_length[0] = task.best_pv_length;
+    for (int i = 0; i < task.best_pv_length; ++i)
+        searcher.pv_table[0][i] = task.best_pv[i];
+
+    if (!prep.checked &&
+        !Searcher::is_mate_window(result.score) &&
+        result.score > task.alpha0 &&
+        result.score < task.beta) {
+        searcher.update_correction_history(
+            static_cast<Color>(root.side_to_move),
+            prep.eval_info.keys,
+            prep.eval_info.raw,
+            result.score,
+            task.depth
+        );
+    }
+
+    searcher.save_tt(
+        root,
+        task.depth,
+        0,
+        result.score,
+        prep.eval_info.raw,
+        result.best_move,
+        task.alpha0,
+        task.beta,
+        true
+    );
+    return result;
+}
+
+[[maybe_unused]] [[nodiscard]] SearchResult search_root_parallel(
+    Searcher& main_searcher,
+    RootThreadPool& pool,
+    const Position& root,
+    int depth,
+    Move hint_move,
+    int alpha,
+    int beta,
+    Searcher::clock::time_point search_start,
+    u64 attempt_base_nodes
+) {
+    const OrderedRootSearch prep =
+        prepare_ordered_root_search(main_searcher, root, hint_move, depth);
+
+    if (prep.ordered_moves.empty()) {
+        SearchResult result{};
+        result.depth = depth;
+        result.score = prep.checked ? -VALUE_MATE : 0;
+        result.seldepth = main_searcher.seldepth;
+        return result;
+    }
+
+    const int seed_count = std::min<int>(
+        static_cast<int>(prep.ordered_moves.size()),
+        choose_root_seed_count(prep.ordered_moves.size(), main_searcher.limits.thread_count)
+    );
+
+    RootParallelTask task;
+    task.root = &root;
+    task.ordered_moves = &prep.ordered_moves;
+    task.depth = depth;
+    task.alpha0 = alpha;
+    task.beta = beta;
+    task.block_size = choose_root_block_size(prep.ordered_moves.size(), main_searcher.limits.thread_count);
+    task.start_time = search_start;
+    task.best.depth = depth;
+
+    const int remaining_moves =
+        static_cast<int>(prep.ordered_moves.size()) - seed_count;
+    const int helper_count = choose_active_root_helpers(
+        remaining_moves,
+        task.block_size,
+        pool.helper_capacity()
+    );
+
+    int local_alpha = alpha;
+    task.shared_alpha.store(local_alpha, std::memory_order_relaxed);
+    task.next_index.store(seed_count, std::memory_order_relaxed);
+
+    if (helper_count > 0) {
+        pool.dispatch(
+            task,
+            task.start_time,
+            0,
+            main_searcher.limits.shared_nodes,
+            helper_count
+        );
+    }
+
+    for (int i = 0; i < seed_count; ++i) {
+        const Move move = prep.ordered_moves[static_cast<std::size_t>(i)];
+        const Searcher::RootMoveResult outcome =
+            main_searcher.search_root_move(root, move, depth, local_alpha, beta, i == 0);
+        if (i == 0 && (outcome.score <= alpha || outcome.score >= beta)) {
+            main_searcher.publish_nodes();
+            if (helper_count > 0) {
+                task.cutoff.store(true, std::memory_order_relaxed);
+                pool.wait();
+            }
+
+            SearchResult fail_result{};
+            fail_result.best_move = move;
+            fail_result.score = outcome.score;
+            fail_result.depth = depth;
+            fail_result.seldepth = main_searcher.seldepth;
+            fail_result.nodes = main_searcher.limits.shared_nodes != nullptr
+                ? main_searcher.limits.shared_nodes->load(std::memory_order_relaxed) - attempt_base_nodes
+                : main_searcher.nodes;
+            return fail_result;
+        }
+
+        if (outcome.improved_alpha) {
+            local_alpha = outcome.score;
+            task.shared_alpha.store(local_alpha, std::memory_order_relaxed);
+        }
+        task.submit(main_searcher, move, outcome);
+
+        if (outcome.score >= beta) {
+            main_searcher.publish_nodes();
+            if (helper_count > 0) {
+                task.cutoff.store(true, std::memory_order_relaxed);
+                pool.wait();
+            }
+            return finalize_parallel_root(main_searcher, prep, task, root, attempt_base_nodes);
+        }
+    }
+
+    if (main_searcher.stopped ||
+        seed_count >= static_cast<int>(prep.ordered_moves.size())) {
+        main_searcher.publish_nodes();
+        if (helper_count > 0) {
+            task.cutoff.store(true, std::memory_order_relaxed);
+            pool.wait();
+        }
+        return finalize_parallel_root(main_searcher, prep, task, root, attempt_base_nodes);
+    }
+
+    search_root_blocks(main_searcher, task);
+    if (helper_count > 0)
+        pool.wait();
+
+    return finalize_parallel_root(main_searcher, prep, task, root, attempt_base_nodes);
+}
+
 } // namespace
 
 std::string move_to_uci(Move m) {
@@ -2446,150 +2995,567 @@ std::string move_to_uci(Move m) {
     return s;
 }
 
+[[nodiscard]] SearchResult iterative_deepening_single(
+    const Position& root,
+    memory::Memory& mem,
+    const SearchLimits& limits,
+    std::ostream* out
+) {
+    struct IterativeWorkerResult {
+        SearchResult best{};
+        Move pv[MAX_PLY]{};
+        int pv_length = 0;
+    };
+
+    const auto capture_completed_result = [](
+        IterativeWorkerResult& result,
+        const SearchResult& best,
+        const Searcher& searcher
+    ) noexcept {
+        result.best = best;
+        result.pv_length = searcher.pv_length[0];
+        for (int i = 0; i < result.pv_length; ++i)
+            result.pv[i] = searcher.pv_table[0][i];
+    };
+
+    const auto emit_iteration_info = [](
+        std::ostream& stream,
+        memory::Memory& local_mem,
+        const Position& local_root,
+        const Searcher& searcher,
+        const SearchResult& current,
+        const Move* pv,
+        int pv_length,
+        Searcher::clock::time_point search_start,
+        u64 nodes,
+        int depth,
+        int max_depth,
+        int& cached_hashfull
+    ) {
+        const double seconds =
+            std::chrono::duration<double>(Searcher::clock::now() - search_start).count();
+        const u64 nps = seconds > 0.0
+            ? static_cast<u64>(static_cast<double>(nodes) / seconds)
+            : 0ULL;
+        const u64 time_ms = static_cast<u64>(seconds * 1000.0);
+        if (depth == 1 ||
+            depth == max_depth ||
+            (depth % HASHFULL_REPORT_PERIOD) == 0) {
+            cached_hashfull = memory::tt_hashfull(local_mem.tt);
+        }
+
+        stream << "info depth " << depth
+               << " seldepth " << current.seldepth << ' ';
+        append_uci_score(stream, current.score, local_root, searcher.use_nnue());
+        stream << " nodes " << nodes
+               << " nps " << nps
+               << " hashfull " << cached_hashfull
+               << " time " << time_ms
+               << " pv";
+
+        for (int i = 0; i < pv_length; ++i)
+            stream << ' ' << move_to_uci(pv[i]);
+
+        stream << '\n';
+    };
+
+    const auto iterative_deepening_worker = [&](
+        Searcher& searcher,
+        const Position& local_root,
+        std::ostream* local_out
+    ) -> IterativeWorkerResult {
+        IterativeWorkerResult result{};
+        SearchResult best{};
+        Move hint_move = 0;
+        Position keyed_root = local_root;
+        position_refresh_key(keyed_root, searcher.mem.tables);
+        const auto search_start = Searcher::clock::now();
+        searcher.start_time = search_start;
+        u64 total_nodes = 0;
+        int cached_hashfull = 0;
+        const int max_depth = std::max(1, searcher.limits.depth);
+
+        for (int depth = 1; depth <= max_depth; ++depth) {
+            SearchResult current{};
+            u64 depth_nodes = 0;
+
+            int alpha = -VALUE_INF;
+            int beta = VALUE_INF;
+            int delta = ASPIRATION_DELTA;
+
+            if (use_root_aspiration(searcher.limits, depth)) {
+                alpha = std::max(-VALUE_INF, best.score - delta);
+                beta = std::min(VALUE_INF, best.score + delta);
+            }
+
+            while (true) {
+                if (searcher.stopped)
+                    break;
+
+                reset_searcher_iteration(searcher, search_start, total_nodes + depth_nodes);
+
+                current = searcher.search_root(keyed_root, depth, hint_move, alpha, beta);
+                current.seldepth = searcher.seldepth;
+                depth_nodes += current.nodes;
+
+                if (searcher.stopped || depth == 1)
+                    break;
+
+                if (current.score <= alpha) {
+                    alpha = std::max(-VALUE_INF, current.score - delta);
+                    beta = std::min(VALUE_INF, current.score + delta);
+                    delta *= 2;
+                    continue;
+                }
+
+                if (current.score >= beta) {
+                    alpha = std::max(-VALUE_INF, current.score - delta);
+                    beta = std::min(VALUE_INF, current.score + delta);
+                    delta *= 2;
+                    continue;
+                }
+
+                break;
+            }
+
+            total_nodes += depth_nodes;
+            const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
+
+            if (!searcher.stopped || best.depth == 0) {
+                best = current;
+                best.nodes = total_nodes;
+                hint_move = current.best_move;
+                capture_completed_result(result, best, searcher);
+            }
+
+            if (local_out != nullptr &&
+                searcher.limits.report_info &&
+                !stopped_mid_depth) {
+                const u64 reported_nodes = searcher.limits.shared_nodes != nullptr
+                    ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
+                    : total_nodes;
+                emit_iteration_info(
+                    *local_out,
+                    searcher.mem,
+                    local_root,
+                    searcher,
+                    current,
+                    searcher.pv_table[0],
+                    searcher.pv_length[0],
+                    search_start,
+                    reported_nodes,
+                    depth,
+                    max_depth,
+                    cached_hashfull
+                );
+            }
+
+            if (stopped_mid_depth)
+                break;
+
+            if (searcher.stop_after_completed_depth())
+                break;
+        }
+
+        result.best.nodes = searcher.limits.shared_nodes != nullptr
+            ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
+            : total_nodes;
+
+#if VALERAIN_CAPTURE_OBS
+        if (local_out != nullptr && searcher.limits.report_info)
+            searcher.emit_capture_observation(*local_out);
+#endif
+#if VALERAIN_MOVEPICKER_OBS
+        if (local_out != nullptr && searcher.limits.report_info)
+            searcher.emit_movepicker_observation(*local_out);
+#endif
+#if VALERAIN_SEARCH_OBS
+        if (local_out != nullptr && searcher.limits.report_info)
+            searcher.emit_search_observation(*local_out);
+#endif
+
+        return result;
+    };
+
+    memory::memory_new_search(mem);
+
+    SearchLimits local_limits = limits;
+    Searcher searcher(mem, local_limits);
+    const IterativeWorkerResult result =
+        iterative_deepening_worker(searcher, root, out);
+    return result.best;
+}
+
+[[nodiscard]] SearchResult iterative_deepening_lazy_smp(
+    const Position& root,
+    memory::Memory& mem,
+    const SearchLimits& limits,
+    std::ostream* out
+) {
+    memory::memory_new_search(mem);
+
+    struct IterativeWorkerResult {
+        SearchResult best{};
+        Move pv[MAX_PLY]{};
+        int pv_length = 0;
+    };
+
+    const auto capture_completed_result = [](
+        IterativeWorkerResult& result,
+        const SearchResult& best,
+        const Searcher& searcher
+    ) noexcept {
+        result.best = best;
+        result.pv_length = searcher.pv_length[0];
+        for (int i = 0; i < result.pv_length; ++i)
+            result.pv[i] = searcher.pv_table[0][i];
+    };
+
+    const auto emit_iteration_info = [](
+        std::ostream& stream,
+        memory::Memory& local_mem,
+        const Position& local_root,
+        const Searcher& searcher,
+        const SearchResult& current,
+        const Move* pv,
+        int pv_length,
+        Searcher::clock::time_point search_start,
+        u64 nodes,
+        int depth,
+        int max_depth,
+        int& cached_hashfull
+    ) {
+        const double seconds =
+            std::chrono::duration<double>(Searcher::clock::now() - search_start).count();
+        const u64 nps = seconds > 0.0
+            ? static_cast<u64>(static_cast<double>(nodes) / seconds)
+            : 0ULL;
+        const u64 time_ms = static_cast<u64>(seconds * 1000.0);
+        if (depth == 1 ||
+            depth == max_depth ||
+            (depth % HASHFULL_REPORT_PERIOD) == 0) {
+            cached_hashfull = memory::tt_hashfull(local_mem.tt);
+        }
+
+        stream << "info depth " << depth
+               << " seldepth " << current.seldepth << ' ';
+        append_uci_score(stream, current.score, local_root, searcher.use_nnue());
+        stream << " nodes " << nodes
+               << " nps " << nps
+               << " hashfull " << cached_hashfull
+               << " time " << time_ms
+               << " pv";
+
+        for (int i = 0; i < pv_length; ++i)
+            stream << ' ' << move_to_uci(pv[i]);
+
+        stream << '\n';
+    };
+
+    const auto iterative_deepening_worker = [&](
+        Searcher& searcher,
+        const Position& local_root,
+        std::ostream* local_out
+    ) -> IterativeWorkerResult {
+        IterativeWorkerResult result{};
+        SearchResult best{};
+        Move hint_move = 0;
+        Position keyed_root = local_root;
+        position_refresh_key(keyed_root, searcher.mem.tables);
+        const auto search_start = Searcher::clock::now();
+        searcher.start_time = search_start;
+        u64 total_nodes = 0;
+        int cached_hashfull = 0;
+        const int max_depth = std::max(1, searcher.limits.depth);
+
+        for (int depth = 1; depth <= max_depth; ++depth) {
+            SearchResult current{};
+            u64 depth_nodes = 0;
+
+            int alpha = -VALUE_INF;
+            int beta = VALUE_INF;
+            int delta = ASPIRATION_DELTA;
+
+            if (use_root_aspiration(searcher.limits, depth)) {
+                alpha = std::max(-VALUE_INF, best.score - delta);
+                beta = std::min(VALUE_INF, best.score + delta);
+            }
+
+            while (true) {
+                if (searcher.stopped)
+                    break;
+
+                reset_searcher_iteration(searcher, search_start, total_nodes + depth_nodes);
+
+                current = searcher.search_root(keyed_root, depth, hint_move, alpha, beta);
+                current.seldepth = searcher.seldepth;
+                depth_nodes += current.nodes;
+
+                if (searcher.stopped || depth == 1)
+                    break;
+
+                if (current.score <= alpha) {
+                    alpha = std::max(-VALUE_INF, current.score - delta);
+                    beta = std::min(VALUE_INF, current.score + delta);
+                    delta *= 2;
+                    continue;
+                }
+
+                if (current.score >= beta) {
+                    alpha = std::max(-VALUE_INF, current.score - delta);
+                    beta = std::min(VALUE_INF, current.score + delta);
+                    delta *= 2;
+                    continue;
+                }
+
+                break;
+            }
+
+            total_nodes += depth_nodes;
+            const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
+
+            if (!searcher.stopped || best.depth == 0) {
+                best = current;
+                best.nodes = total_nodes;
+                hint_move = current.best_move;
+                capture_completed_result(result, best, searcher);
+            }
+
+            if (local_out != nullptr &&
+                searcher.limits.report_info &&
+                !stopped_mid_depth) {
+                const u64 reported_nodes = searcher.limits.shared_nodes != nullptr
+                    ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
+                    : total_nodes;
+                emit_iteration_info(
+                    *local_out,
+                    searcher.mem,
+                    local_root,
+                    searcher,
+                    current,
+                    searcher.pv_table[0],
+                    searcher.pv_length[0],
+                    search_start,
+                    reported_nodes,
+                    depth,
+                    max_depth,
+                    cached_hashfull
+                );
+            }
+
+            if (stopped_mid_depth)
+                break;
+
+            if (searcher.stop_after_completed_depth())
+                break;
+        }
+
+        result.best.nodes = searcher.limits.shared_nodes != nullptr
+            ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
+            : total_nodes;
+
+#if VALERAIN_CAPTURE_OBS
+        if (local_out != nullptr && searcher.limits.report_info)
+            searcher.emit_capture_observation(*local_out);
+#endif
+#if VALERAIN_MOVEPICKER_OBS
+        if (local_out != nullptr && searcher.limits.report_info)
+            searcher.emit_movepicker_observation(*local_out);
+#endif
+#if VALERAIN_SEARCH_OBS
+        if (local_out != nullptr && searcher.limits.report_info)
+            searcher.emit_search_observation(*local_out);
+#endif
+
+        return result;
+    };
+
+    const auto select_lazy_smp_best_index = [](
+        const std::vector<IterativeWorkerResult>& results
+    ) noexcept {
+        int best_index = 0;
+        int min_score = VALUE_INF;
+
+        for (const IterativeWorkerResult& result : results) {
+            if (result.best.depth <= 0 || move_is_none(result.best.best_move))
+                continue;
+            min_score = std::min(min_score, result.best.score);
+        }
+
+        if (min_score == VALUE_INF)
+            return best_index;
+
+        std::vector<std::pair<Move, long long>> vote_map;
+        vote_map.reserve(results.size());
+
+        const auto vote_value = [min_score](const IterativeWorkerResult& result) noexcept {
+            if (result.best.depth <= 0 || move_is_none(result.best.best_move))
+                return 0LL;
+            return static_cast<long long>(result.best.score - min_score + 10)
+                * static_cast<long long>(result.best.depth);
+        };
+
+        for (const IterativeWorkerResult& result : results) {
+            if (result.best.depth <= 0 || move_is_none(result.best.best_move))
+                continue;
+
+            const long long votes = vote_value(result);
+            const Move move = result.best.best_move;
+            auto it = std::find_if(
+                vote_map.begin(),
+                vote_map.end(),
+                [move](const auto& entry) noexcept { return entry.first == move; }
+            );
+            if (it == vote_map.end())
+                vote_map.emplace_back(move, votes);
+            else
+                it->second += votes;
+        }
+
+        const auto move_votes = [&vote_map](Move move) noexcept {
+            const auto it = std::find_if(
+                vote_map.begin(),
+                vote_map.end(),
+                [move](const auto& entry) noexcept { return entry.first == move; }
+            );
+            return it == vote_map.end() ? 0LL : it->second;
+        };
+
+        for (int i = 0; i < static_cast<int>(results.size()); ++i) {
+            const IterativeWorkerResult& candidate = results[static_cast<std::size_t>(i)];
+            const IterativeWorkerResult& incumbent = results[static_cast<std::size_t>(best_index)];
+
+            if (candidate.best.depth <= 0 || move_is_none(candidate.best.best_move))
+                continue;
+            if (incumbent.best.depth <= 0 || move_is_none(incumbent.best.best_move)) {
+                best_index = i;
+                continue;
+            }
+
+            const long long candidate_move_votes = move_votes(candidate.best.best_move);
+            const long long incumbent_move_votes = move_votes(incumbent.best.best_move);
+
+            if (candidate_move_votes > incumbent_move_votes ||
+                (candidate_move_votes == incumbent_move_votes &&
+                 candidate.best.depth > incumbent.best.depth) ||
+                (candidate_move_votes == incumbent_move_votes &&
+                 candidate.best.depth == incumbent.best.depth &&
+                 vote_value(candidate) > vote_value(incumbent)) ||
+                (candidate_move_votes == incumbent_move_votes &&
+                 candidate.best.depth == incumbent.best.depth &&
+                 vote_value(candidate) == vote_value(incumbent) &&
+                 candidate.best.score > incumbent.best.score)) {
+                best_index = i;
+            }
+        }
+
+        return best_index;
+    };
+
+    const auto emit_selected_info = [](
+        std::ostream& stream,
+        memory::Memory& local_mem,
+        const Position& local_root,
+        bool use_nnue,
+        const IterativeWorkerResult& result,
+        Searcher::clock::time_point search_start,
+        u64 nodes
+    ) {
+        const double seconds =
+            std::chrono::duration<double>(Searcher::clock::now() - search_start).count();
+        const u64 nps = seconds > 0.0
+            ? static_cast<u64>(static_cast<double>(nodes) / seconds)
+            : 0ULL;
+        const u64 time_ms = static_cast<u64>(seconds * 1000.0);
+        const int hashfull = memory::tt_hashfull(local_mem.tt);
+
+        stream << "info depth " << result.best.depth
+               << " seldepth " << result.best.seldepth << ' ';
+        append_uci_score(stream, result.best.score, local_root, use_nnue);
+        stream << " nodes " << nodes
+               << " nps " << nps
+               << " hashfull " << hashfull
+               << " time " << time_ms
+               << " pv";
+
+        for (int i = 0; i < result.pv_length; ++i)
+            stream << ' ' << move_to_uci(result.pv[i]);
+
+        stream << '\n';
+    };
+
+    SearchLimits main_limits = limits;
+    std::atomic<bool> shared_stop{false};
+    std::atomic<u64> shared_nodes{0};
+    main_limits.thread_id = 0;
+    main_limits.thread_count = std::max(1, limits.thread_count);
+    main_limits.report_info = true;
+    main_limits.external_stop = limits.stop;
+    main_limits.stop = &shared_stop;
+    main_limits.shared_nodes = &shared_nodes;
+
+    Searcher main_searcher(mem, main_limits);
+    const auto search_start = Searcher::clock::now();
+
+    const int worker_count = main_limits.thread_count;
+    std::vector<IterativeWorkerResult> results(static_cast<std::size_t>(worker_count));
+    std::vector<std::unique_ptr<RootWorker>> helpers;
+    std::vector<std::thread> helper_threads;
+    helpers.reserve(static_cast<std::size_t>(std::max(0, worker_count - 1)));
+    helper_threads.reserve(static_cast<std::size_t>(std::max(0, worker_count - 1)));
+
+    for (int i = 1; i < worker_count; ++i) {
+        SearchLimits helper_limits = main_limits;
+        helper_limits.thread_id = i;
+        helper_limits.report_info = false;
+        helper_limits.soft_time_ms = 0;
+        helper_limits.hard_time_ms = 0;
+        helper_limits.infinite = true;
+
+        auto helper = std::make_unique<RootWorker>(mem, helper_limits);
+        RootWorker* helper_ptr = helper.get();
+        helper_threads.emplace_back([&, i, helper_ptr]() {
+            results[static_cast<std::size_t>(i)] =
+                iterative_deepening_worker(helper_ptr->searcher, root, nullptr);
+        });
+        helpers.push_back(std::move(helper));
+    }
+
+    results[0] = iterative_deepening_worker(main_searcher, root, out);
+    shared_stop.store(true, std::memory_order_release);
+
+    for (std::thread& thread : helper_threads)
+        thread.join();
+
+    const int best_index = select_lazy_smp_best_index(results);
+    IterativeWorkerResult best = results[static_cast<std::size_t>(best_index)];
+    best.best.nodes = shared_nodes.load(std::memory_order_relaxed);
+
+    if (best_index != 0 && out != nullptr) {
+        emit_selected_info(
+            *out,
+            mem,
+            root,
+            main_searcher.use_nnue(),
+            best,
+            search_start,
+            best.best.nodes
+        );
+    }
+
+    return best.best;
+}
+
 SearchResult iterative_deepening(
     const Position& root,
     memory::Memory& mem,
     const SearchLimits& limits,
     std::ostream* out
 ) {
-    // Iterative deepening provides progressively better moves, while aspiration
-    // windows reuse the previous iteration score to narrow the root window.
-    memory::memory_new_search(mem);
+    if (limits.thread_count <= 1)
+        return iterative_deepening_single(root, mem, limits, out);
 
-    Searcher searcher(mem, limits);
-    SearchResult best{};
-    Move hint_move = 0;
-    Position keyed_root = root;
-    position_refresh_key(keyed_root, mem.tables);
-    const auto search_start = Searcher::clock::now();
-    searcher.start_time = search_start;
-    u64 total_nodes = 0;
-    int cached_hashfull = 0;
-
-    const int max_depth = std::max(1, limits.depth);
-
-    for (int depth = 1; depth <= max_depth; ++depth) {
-        SearchResult current{};
-        u64 depth_nodes = 0;
-
-        int alpha = -VALUE_INF;
-        int beta = VALUE_INF;
-        int delta = ASPIRATION_DELTA;
-
-        if (depth >= 2) {
-            alpha = std::max(-VALUE_INF, best.score - delta);
-            beta = std::min(VALUE_INF, best.score + delta);
-        }
-
-        while (true) {
-            if (searcher.stopped)
-                break;
-
-            searcher.nodes = 0;
-            searcher.base_nodes = total_nodes + depth_nodes;
-            searcher.seldepth = 0;
-            searcher.nmp_min_ply = 0;
-            std::fill(std::begin(searcher.pv_length), std::end(searcher.pv_length), 0);
-            std::fill(std::begin(searcher.move_stack), std::end(searcher.move_stack), Move(0));
-            std::fill(
-                std::begin(searcher.search_stack),
-                std::end(searcher.search_stack),
-                SearchStackEntry{}
-            );
-            std::fill(
-                std::begin(searcher.static_eval_valid),
-                std::end(searcher.static_eval_valid),
-                false
-            );
-
-            current = searcher.search_root(keyed_root, depth, hint_move, alpha, beta);
-            current.seldepth = searcher.seldepth;
-            depth_nodes += current.nodes;
-
-            if (searcher.stopped || depth == 1)
-                break;
-
-            if (current.score <= alpha) {
-                alpha = std::max(-VALUE_INF, current.score - delta);
-                beta = std::min(VALUE_INF, current.score + delta);
-                delta *= 2;
-                continue;
-            }
-
-            if (current.score >= beta) {
-                alpha = std::max(-VALUE_INF, current.score - delta);
-                beta = std::min(VALUE_INF, current.score + delta);
-                delta *= 2;
-                continue;
-            }
-
-            break;
-        }
-
-        const auto end = Searcher::clock::now();
-        total_nodes += depth_nodes;
-        const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
-
-        if (!searcher.stopped || best.depth == 0) {
-            best = current;
-            best.nodes = total_nodes;
-            hint_move = current.best_move;
-        }
-
-        if (out && !stopped_mid_depth) {
-            const double seconds =
-                std::chrono::duration<double>(end - search_start).count();
-            const u64 nps = seconds > 0.0
-                ? static_cast<u64>(static_cast<double>(total_nodes) / seconds)
-                : 0ULL;
-            const u64 time_ms = static_cast<u64>(seconds * 1000.0);
-            if (depth == 1 ||
-                depth == max_depth ||
-                (depth % HASHFULL_REPORT_PERIOD) == 0) {
-                cached_hashfull = memory::tt_hashfull(mem.tt);
-            }
-
-            *out << "info depth " << depth
-                 << " seldepth " << current.seldepth << ' ';
-            append_uci_score(*out, current.score, root, searcher.use_nnue());
-            *out << " nodes " << total_nodes
-                 << " nps " << nps
-                 << " hashfull " << cached_hashfull
-                 << " time " << time_ms
-                 << " pv";
-
-            for (int i = 0; i < searcher.pv_length[0]; ++i)
-                *out << ' ' << move_to_uci(searcher.pv_table[0][i]);
-
-            *out << '\n';
-            // if (searcher.use_nnue()) {
-            //     *out << "info string winrate "
-            //          << nnue::search_score_to_winrate(current.score, root)
-            //          << '\n';
-            // }
-        }
-
-        if (stopped_mid_depth)
-            break;
-
-        if (searcher.stop_after_completed_depth())
-            break;
-    }
-
-    best.nodes = total_nodes;
-#if VALERAIN_CAPTURE_OBS
-    if (out)
-        searcher.emit_capture_observation(*out);
-#endif
-#if VALERAIN_MOVEPICKER_OBS
-    if (out)
-        searcher.emit_movepicker_observation(*out);
-#endif
-#if VALERAIN_SEARCH_OBS
-    if (out)
-        searcher.emit_search_observation(*out);
-#endif
-    return best;
+    return iterative_deepening_lazy_smp(root, mem, limits, out);
 }
 
 } // namespace valerain::search

@@ -25,6 +25,7 @@ SOFTWARE.
 #include "Attack.h"
 #include "Bench.h"
 #include "Memory.h"
+#include "Nnue.h"
 #include "Perft.h"
 #include "Position.h"
 #include "Search.h"
@@ -34,6 +35,7 @@ SOFTWARE.
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -45,6 +47,7 @@ namespace valerain {
 namespace {
 
 constexpr std::string_view BENCH_SEPARATOR = "===========================";
+constexpr int MAX_SEARCH_THREADS = 512;
 
 constexpr std::array<std::string_view, 8> SEARCH_BENCH_FENS{{
     "1rbqk2r/p2pppbp/6p1/3QP3/8/4B3/PPP2PPP/2KR1B1R b k - 2 11",
@@ -62,6 +65,44 @@ struct SearchBenchResult {
     u64 time_ms = 0;
     u64 nps = 0;
 };
+
+[[nodiscard]] std::string default_eval_file() {
+    constexpr const char* candidates[] = {
+        "Evalfile.bin",
+        "bin/Evalfile.bin",
+        "src/bin/Evalfile.bin",
+        "src/Evalfile.bin",
+        "src/bin/quantised.bin",
+        "NnueFile/nn-2a5d6101d177.nnue",
+        "src/NnueFile/nn-2a5d6101d177.nnue",
+        "NnueFile/nn-37f18f62d772.nnue",
+        "src/NnueFile/nn-37f18f62d772.nnue"
+    };
+
+    for (const char* candidate : candidates)
+        if (std::filesystem::exists(candidate))
+            return candidate;
+
+    return "Evalfile.bin";
+}
+
+[[nodiscard]] bool ensure_nnue_loaded(
+    const std::string& eval_file,
+    std::ostream* out
+) {
+    if (nnue::loaded() && nnue::path() == eval_file)
+        return true;
+
+    if (nnue::load(eval_file)) {
+        if (out)
+            *out << "info string loaded nnue " << eval_file << '\n';
+        return true;
+    }
+
+    if (out)
+        *out << "info string failed to load nnue: " << nnue::last_error() << '\n';
+    return false;
+}
 
 [[nodiscard]] bool parse_int(std::string_view sv, int& value) noexcept {
     const char* first = sv.data();
@@ -298,13 +339,16 @@ PerftBenchResult benchmark_perft(
 bool run_search_bench(
     memory::Memory& mem,
     int depth,
+    std::size_t threads,
     bool use_nnue,
     std::ostream& out
 ) {
     u64 total_time_ms = 0;
     u64 total_nodes = 0;
 
-    out << "info string Using 1 thread\n\n";
+    const int search_threads = std::clamp<int>(static_cast<int>(threads), 1, MAX_SEARCH_THREADS);
+    out << "info string Using " << search_threads << " thread"
+        << (search_threads == 1 ? "" : "s") << "\n\n";
 
     for (std::size_t i = 0; i < SEARCH_BENCH_FENS.size(); ++i) {
         Position bench_pos{};
@@ -320,6 +364,9 @@ bool run_search_bench(
         search::SearchLimits limits{};
         limits.depth = depth;
         limits.use_nnue = use_nnue;
+        limits.thread_count = search_threads;
+        limits.thread_id = 0;
+        limits.report_info = true;
 
         const SearchBenchResult res = benchmark_search_position(
             bench_pos,
@@ -343,13 +390,16 @@ bool run_search_bench(
 bool run_timed_search_bench(
     memory::Memory& mem,
     int movetime_ms,
+    std::size_t threads,
     bool use_nnue,
     std::ostream& out
 ) {
     u64 total_time_ms = 0;
     u64 total_nodes = 0;
 
-    out << "info string Using 1 thread\n\n";
+    const int search_threads = std::clamp<int>(static_cast<int>(threads), 1, MAX_SEARCH_THREADS);
+    out << "info string Using " << search_threads << " thread"
+        << (search_threads == 1 ? "" : "s") << "\n\n";
 
     for (std::size_t i = 0; i < SEARCH_BENCH_FENS.size(); ++i) {
         Position bench_pos{};
@@ -367,6 +417,9 @@ bool run_timed_search_bench(
         limits.soft_time_ms = movetime_ms;
         limits.hard_time_ms = movetime_ms;
         limits.use_nnue = use_nnue;
+        limits.thread_count = search_threads;
+        limits.thread_id = 0;
+        limits.report_info = true;
 
         const SearchBenchResult res = benchmark_search_position(
             bench_pos,
@@ -395,16 +448,26 @@ BenchConfig parse_config(int argc, char** argv) noexcept {
         cfg.divide = true;
         argi = 2;
     }
-    else if (argc > 1 &&
-             (std::string_view(argv[1]) == "search" ||
-              std::string_view(argv[1]) == "bench")) {
+    else if (argc > 1 && std::string_view(argv[1]) == "search") {
         cfg.search = true;
+        argi = 2;
+    }
+    else if (argc > 1 && std::string_view(argv[1]) == "bench") {
+        cfg.search = true;
+        cfg.timed_search = true;
         argi = 2;
     }
 
     if (cfg.search) {
-        if (argc > argi) cfg.search_depth = std::max(1, std::atoi(argv[argi]));
+        if (cfg.timed_search) {
+            if (argc > argi)
+                cfg.search_movetime_ms = std::max(1, std::atoi(argv[argi]));
+        } else {
+            if (argc > argi)
+                cfg.search_depth = std::max(1, std::atoi(argv[argi]));
+        }
         if (argc > argi + 1) cfg.hash_mb = static_cast<std::size_t>(std::strtoull(argv[argi + 1], nullptr, 10));
+        if (argc > argi + 2) cfg.threads = static_cast<std::size_t>(std::strtoull(argv[argi + 2], nullptr, 10));
     } else {
         if (argc > argi) cfg.perft_depth = std::max(0, std::atoi(argv[argi]));
         if (argc > argi + 1) cfg.hash_mb = static_cast<std::size_t>(std::strtoull(argv[argi + 1], nullptr, 10));
@@ -420,6 +483,7 @@ BenchConfig parse_config(int argc, char** argv) noexcept {
 
 int run_bench(int argc, char** argv) { 
     const BenchConfig cfg = parse_config(argc, argv);
+    bool use_nnue = false;
 
     memory::Memory mem{};
     memory_init(mem, cfg.hash_mb, 8, 2);
@@ -435,7 +499,16 @@ int run_bench(int argc, char** argv) {
     }
 
     if (cfg.search) {
-        const bool ok = run_search_bench(mem, cfg.search_depth, false, std::cout);
+        if (cfg.timed_search) {
+            const std::string eval_file = default_eval_file();
+            use_nnue = ensure_nnue_loaded(eval_file, &std::cout);
+            if (!use_nnue)
+                std::cout << "info string nnue unavailable, bench will use hce\n";
+        }
+
+        const bool ok = cfg.timed_search
+            ? run_timed_search_bench(mem, cfg.search_movetime_ms, cfg.threads, use_nnue, std::cout)
+            : run_search_bench(mem, cfg.search_depth, cfg.threads, false, std::cout);
         memory_free(mem);
         return ok ? 0 : 1;
     }

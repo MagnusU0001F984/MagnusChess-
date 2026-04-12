@@ -40,6 +40,72 @@ namespace valerain {
 
 namespace {
 
+constexpr int kMaterialNibbleBits = 4;
+constexpr int kMaterialPiecesPerColor = 5;
+constexpr u8 kNonKingMaterialWeight[PIECE_NB] = {
+    1, 3, 3, 5, 9, 0
+};
+
+[[nodiscard]] inline bool tracks_material(PieceType piece_type) noexcept {
+    return piece_type >= PAWN && piece_type <= QUEEN;
+}
+
+[[nodiscard]] inline int material_shift(Color color, PieceType piece_type) noexcept {
+    return static_cast<int>(color) * (kMaterialPiecesPerColor * kMaterialNibbleBits)
+        + static_cast<int>(piece_type) * kMaterialNibbleBits;
+}
+
+inline void refresh_material_signature(
+    Position& pos,
+    Color color,
+    PieceType piece_type
+) noexcept {
+    if (!tracks_material(piece_type))
+        return;
+
+    const int shift = material_shift(color, piece_type);
+    const Key mask = static_cast<Key>(0xFULL) << shift;
+    pos.material_signature =
+        (pos.material_signature & ~mask)
+        | (static_cast<Key>(pos.piece_counts[color][piece_type]) << shift);
+}
+
+inline void add_piece_to_caches(
+    Position& pos,
+    Color color,
+    PieceType piece_type
+) noexcept {
+    pos.piece_counts[color][piece_type] = static_cast<u8>(
+        static_cast<int>(pos.piece_counts[color][piece_type]) + 1
+    );
+
+    if (!tracks_material(piece_type))
+        return;
+
+    pos.non_king_material = static_cast<u8>(
+        non_king_material(pos) + static_cast<int>(kNonKingMaterialWeight[piece_type])
+    );
+    refresh_material_signature(pos, color, piece_type);
+}
+
+inline void remove_piece_from_caches(
+    Position& pos,
+    Color color,
+    PieceType piece_type
+) noexcept {
+    pos.piece_counts[color][piece_type] = static_cast<u8>(
+        static_cast<int>(pos.piece_counts[color][piece_type]) - 1
+    );
+
+    if (!tracks_material(piece_type))
+        return;
+
+    pos.non_king_material = static_cast<u8>(
+        non_king_material(pos) - static_cast<int>(kNonKingMaterialWeight[piece_type])
+    );
+    refresh_material_signature(pos, color, piece_type);
+}
+
 /*
 These helpers keep the incremental Zobrist key maintenance localized. The
 plain board mutators stay oblivious to hashing, while the keyed copy-make path
@@ -137,8 +203,12 @@ void position_clear(Position& pos) noexcept {
 
     for (int pt = 0; pt < PIECE_NB; ++pt)
         pos.piece_bb[pt] = 0ULL;
+    for (auto& counts : pos.piece_counts)
+        counts.fill(0);
 
     pos.occupied = 0ULL;
+    pos.non_king_material = 0;
+    pos.material_signature = 0ULL;
     pos.eval_mg[WHITE] = 0;
     pos.eval_mg[BLACK] = 0;
     pos.eval_eg[WHITE] = 0;
@@ -220,6 +290,7 @@ void position_put_piece(
     pos.color_bb[color] |= bb;
     pos.piece_bb[piece_type] |= bb;
     pos.occupied |= bb;
+    add_piece_to_caches(pos, color, piece_type);
     pos.board[sq] = static_cast<int>(make_piece(color, piece_type));
     eval::on_piece_added(pos, color, piece_type, sq);
     nnue::on_piece_added(pos, color, piece_type, sq);
@@ -239,6 +310,7 @@ void position_remove_piece(
     pos.color_bb[color] &= ~bb;
     pos.piece_bb[piece_type] &= ~bb;
     pos.occupied &= ~bb;
+    remove_piece_from_caches(pos, color, piece_type);
     pos.board[sq] = PIECE_NONE;
     eval::on_piece_removed(pos, color, piece_type, sq);
     nnue::on_piece_removed(pos, color, piece_type, sq);
@@ -281,6 +353,7 @@ bool position_has_valid_kings(const Position& pos) noexcept {
 bool position_board_matches_bitboards(const Position& pos) noexcept {
     Bitboard color_occ[COLOR_NB]{};
     Bitboard piece_occ[PIECE_NB]{};
+    std::array<std::array<u8, PIECE_NB>, COLOR_NB> piece_counts{};
 
     for (int sq = 0; sq < SQ_NB; ++sq) {
         const Piece pc = static_cast<Piece>(pos.board[sq]);
@@ -291,6 +364,28 @@ bool position_board_matches_bitboards(const Position& pos) noexcept {
 
         color_occ[c] |= bb_of(sq);
         piece_occ[pt] |= bb_of(sq);
+        piece_counts[c][pt] = static_cast<u8>(static_cast<int>(piece_counts[c][pt]) + 1);
+    }
+
+    int expected_non_king_material = 0;
+    Key expected_material_signature = 0ULL;
+    for (int color = WHITE; color <= BLACK; ++color) {
+        const Color piece_color = static_cast<Color>(color);
+        for (int piece_type = PAWN; piece_type <= KING; ++piece_type) {
+            const PieceType pt = static_cast<PieceType>(piece_type);
+            if (piece_counts[piece_color][pt] != pos.piece_counts[piece_color][pt])
+                return false;
+
+            if (!tracks_material(pt))
+                continue;
+
+            expected_non_king_material +=
+                static_cast<int>(piece_counts[piece_color][pt])
+                * static_cast<int>(kNonKingMaterialWeight[pt]);
+            expected_material_signature |=
+                static_cast<Key>(piece_counts[piece_color][pt])
+                << material_shift(piece_color, pt);
+        }
     }
 
     return color_occ[WHITE] == pos.color_bb[WHITE] &&
@@ -301,7 +396,9 @@ bool position_board_matches_bitboards(const Position& pos) noexcept {
            piece_occ[ROOK]   == pos.piece_bb[ROOK] &&
            piece_occ[QUEEN]  == pos.piece_bb[QUEEN] &&
            piece_occ[KING]   == pos.piece_bb[KING] &&
-           (pos.color_bb[WHITE] | pos.color_bb[BLACK]) == pos.occupied;
+           (pos.color_bb[WHITE] | pos.color_bb[BLACK]) == pos.occupied &&
+           expected_non_king_material == non_king_material(pos) &&
+           expected_material_signature == packed_material_signature(pos);
 }
 
 void make_move(

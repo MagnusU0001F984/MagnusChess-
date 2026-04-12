@@ -50,6 +50,9 @@ struct Position {
     Bitboard color_bb[COLOR_NB]{};
     Bitboard piece_bb[PIECE_NB]{};
     Bitboard occupied = 0ULL;
+    std::array<std::array<u8, PIECE_NB>, COLOR_NB> piece_counts{};
+    u8 non_king_material = 0;
+    Key material_signature = 0ULL;
 
     int eval_mg[COLOR_NB]{};
     int eval_eg[COLOR_NB]{};
@@ -98,6 +101,18 @@ inline Bitboard pieces_of_type(const Position& pos, PieceType pt) noexcept {
 
 inline Bitboard pieces(const Position& pos, Color color, PieceType pt) noexcept {
     return pos.color_bb[color] & pos.piece_bb[pt];
+}
+
+inline int piece_count(const Position& pos, Color color, PieceType pt) noexcept {
+    return static_cast<int>(pos.piece_counts[color][pt]);
+}
+
+inline int non_king_material(const Position& pos) noexcept {
+    return static_cast<int>(pos.non_king_material);
+}
+
+inline Key packed_material_signature(const Position& pos) noexcept {
+    return pos.material_signature;
 }
 
 inline Square king_square(const Position& pos, Color color) noexcept {

@@ -39,13 +39,17 @@ Bench mode is the command-line utility layer used for quick perft checks and
 fixed-depth search/bench benchmarks outside of UCI.
 */
 
+inline constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
+
 struct BenchConfig {
     int perft_depth = 10;
     int search_depth = 6;
+    int search_movetime_ms = DEFAULT_BENCH_MOVETIME_MS;
     std::size_t hash_mb = 64ULL;
     std::size_t threads = 1ULL;
     bool divide = false;
     bool search = false;
+    bool timed_search = false;
     bool live_divide = false;
 };
 
@@ -70,6 +74,7 @@ void set_start_position(Position& pos) noexcept;
 [[nodiscard]] bool run_search_bench(
     memory::Memory& mem,
     int depth,
+    std::size_t threads,
     bool use_nnue,
     std::ostream& out
 );
@@ -77,6 +82,7 @@ void set_start_position(Position& pos) noexcept;
 [[nodiscard]] bool run_timed_search_bench(
     memory::Memory& mem,
     int movetime_ms,
+    std::size_t threads,
     bool use_nnue,
     std::ostream& out
 );

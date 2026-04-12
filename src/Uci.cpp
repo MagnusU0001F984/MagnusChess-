@@ -24,6 +24,7 @@ SOFTWARE.
 
 #include "Uci.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <charconv>
@@ -55,8 +56,8 @@ namespace valerain {
 namespace {
 
 constexpr int DEFAULT_UCI_DEPTH = 8;
-constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
-
+constexpr int DEFAULT_UCI_THREADS = 1;
+constexpr int MAX_UCI_THREADS = 512;
 struct PositionHistory {
     Key keys[search::MAX_GAME_HISTORY]{};
     int count = 0;
@@ -446,6 +447,7 @@ inline void push_position_history(
 void handle_setoption(
     memory::Memory& mem,
     bool& use_nnue,
+    int& threads,
     std::string& eval_file,
     std::ostream& out,
     std::string_view command
@@ -477,6 +479,11 @@ void handle_setoption(
         int mb = 0;
         if (parse_int(value, mb) && mb > 0)
             memory::tt_resize_mb(mem.tt, static_cast<std::size_t>(mb));
+    }
+    else if (name == "Threads") {
+        int parsed_threads = 0;
+        if (parse_int(value, parsed_threads))
+            threads = std::clamp(parsed_threads, 1, MAX_UCI_THREADS);
     }
     else if (name == "Clear Hash") {
         memory::memory_clear_hash(mem);
@@ -661,6 +668,7 @@ struct UciSession {
     PositionHistory position_history{};
     timeman::TimeManager time_manager{};
     bool use_nnue = true;
+    int threads = DEFAULT_UCI_THREADS;
     std::string eval_file = default_eval_file();
     std::atomic<bool> stop_requested{false};
     std::atomic<bool> search_running{false};
@@ -700,6 +708,7 @@ struct UciSession {
         out << "id name Valerain 0.0.8\n";
         out << "id author Magnus\n";
         out << "option name Hash type spin default 64 min 1 max 33554432\n";
+        out << "option name Threads type spin default 1 min 1 max " << MAX_UCI_THREADS << "\n";
         out << "option name Clear Hash type button\n";
         out << "option name UseNNUE type check default true\n";
         out << "option name EvalFile type string default " << eval_file << '\n';
@@ -774,6 +783,7 @@ struct UciSession {
         if (!run_timed_search_bench(
                 mem,
                 DEFAULT_BENCH_MOVETIME_MS,
+                static_cast<std::size_t>(threads),
                 use_nnue,
                 out
             ))
@@ -802,6 +812,9 @@ struct UciSession {
 
         limits.use_nnue = use_nnue;
         limits.stop = &stop_requested;
+        limits.thread_count = threads;
+        limits.thread_id = 0;
+        limits.report_info = true;
         copy_history_to_limits(limits);
         stop_requested.store(false, std::memory_order_release);
 
@@ -826,14 +839,14 @@ struct UciSession {
 
     void handle_perft(std::string_view line, std::ostream& out) {
         int depth = -1;
-        std::size_t threads = 0;
+        std::size_t perft_threads = 0;
         bool live = false;
-        if (!parse_divide_command(line, depth, threads, live)) {
+        if (!parse_divide_command(line, depth, perft_threads, live)) {
             out << divide_usage_hint() << '\n';
             return;
         }
 
-        divide(pos, mem, depth, out, threads, true);
+        divide(pos, mem, depth, out, perft_threads, true);
     }
 
     [[nodiscard]] bool process_command(
@@ -873,7 +886,7 @@ struct UciSession {
         }
 
         if (command_starts_with(line, "setoption")) {
-            handle_setoption(mem, use_nnue, eval_file, out, line);
+            handle_setoption(mem, use_nnue, threads, eval_file, out, line);
             return true;
         }
 
