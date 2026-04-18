@@ -888,11 +888,11 @@ struct UciSession {
     }
 
     void emit_banner(std::ostream& out) const {
-        out << "ValerainChess 0.0.9 by the Magnus developer" << std::endl;
+        out << "ValerainChess 0.1.0 by the Magnus developer" << std::endl;
     }
 
     void emit_uci_id(std::ostream& out) const {
-        out << "id name ValerainChess 0.0.9\n";
+        out << "id name ValerainChess 0.1.0\n";
         out << "id author Magnus\n";
         out << "option name Hash type spin default 64 min 1 max 33554432\n";
         out << "option name Threads type spin default 1 min 1 max " << MAX_UCI_THREADS << "\n";

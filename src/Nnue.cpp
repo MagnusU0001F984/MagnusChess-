@@ -134,8 +134,7 @@ template<typename T>
     int cp,
     const Position& pos
 ) noexcept {
-    // Our search score is already in displayed UCI cp units, so unlike
-    // Viridithas we feed cp directly into the WDL model's normalized x-axis.
+    // The WDL model expects displayed UCI cp units on its normalized x-axis.
     const double m = static_cast<double>(std::min(240, game_ply(pos))) / 64.0;
     const double a =
         (((kUciWdlAs[0] * m + kUciWdlAs[1]) * m + kUciWdlAs[2]) * m)
@@ -695,7 +694,8 @@ int win_rate_model(int v, const Position& pos) noexcept {
 }
 
 int search_score(int v, const Position& pos) noexcept {
-    return to_cp(v, pos);
+    (void)pos;
+    return v;
 }
 
 int search_score_to_winrate(int score, const Position& pos) noexcept {
@@ -703,12 +703,11 @@ int search_score_to_winrate(int score, const Position& pos) noexcept {
 }
 
 WdlTriplet search_score_to_wdl(int score, const Position& pos) noexcept {
-    return uci_wdl_from_cp(score, pos);
+    return uci_wdl_from_cp(search_score_to_cp(score, pos), pos);
 }
 
 int search_score_to_cp(int score, const Position& pos) noexcept {
-    (void)pos;
-    return score;
+    return to_cp(score, pos);
 }
 
 } // namespace valerain::nnue
