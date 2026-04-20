@@ -85,6 +85,7 @@ void HistoryTables::clear() noexcept {
     countermove = {};
     continuation = {};
     see_bias = {};
+    pawn_history = {};
 }
 
 } // namespace valerain::search

@@ -72,6 +72,7 @@ constexpr int FUTILITY_HISTORY_DIVISOR = 128;
 constexpr int RFP_BASE_MARGIN = 56;
 constexpr int RFP_DEPTH_MARGIN = 72;
 constexpr int RFP_IMPROVING_MARGIN = 40;
+constexpr int RFP_OPPONENT_WORSENING_MARGIN = 24;
 constexpr int RFP_CORRECTION_THRESHOLD = 128;
 constexpr int RFP_CORRECTION_MARGIN_BONUS = 8;
 constexpr int RFP_TT_CAPTURE_MARGIN_REDUCTION = 16;
@@ -756,6 +757,7 @@ struct Searcher {
     [[nodiscard]] static inline int reverse_futility_margin(
         int depth,
         bool improving,
+        bool opponent_worsening,
         int correction,
         Move tt_move,
         memory::Bound tt_bound,
@@ -764,7 +766,8 @@ struct Searcher {
     ) noexcept {
         int margin = RFP_BASE_MARGIN
             + depth * RFP_DEPTH_MARGIN
-            - (improving ? RFP_IMPROVING_MARGIN : 0);
+            - (improving ? RFP_IMPROVING_MARGIN : 0)
+            - (opponent_worsening ? RFP_OPPONENT_WORSENING_MARGIN : 0);
 
         if (correction > RFP_CORRECTION_THRESHOLD)
             margin += RFP_CORRECTION_MARGIN_BONUS;
@@ -1598,6 +1601,20 @@ struct Searcher {
         const int correction = static_eval - base_eval;
         store_static_eval(ply, static_eval);
         const bool improving = !checked && improving_position(ply, static_eval);
+        const bool opponent_worsening = !checked && ply > 0
+            && static_eval_valid[ply - 1]
+            && static_eval > -static_eval_stack[ply - 1];
+
+        // Hindsight depth adjustment: compensate for prior LMR under/over-reduction.
+        const int prior_reduction_plies = ply > 0
+            ? search_stack[ply - 1].reduction_fp / 1024 : 0;
+        if (prior_reduction_plies >= 3 && !opponent_worsening)
+            search_depth++;
+        if (prior_reduction_plies >= 2 && search_depth >= 2
+            && ply > 0 && static_eval_valid[ply - 1]
+            && static_eval + static_eval_stack[ply - 1] > 195)
+            search_depth--;
+
         const Color side = static_cast<Color>(pos.side_to_move);
         SearchStackEntry& ss = search_stack[ply];
         ss.current_move = Move(0);
@@ -1627,6 +1644,7 @@ struct Searcher {
             static_eval - reverse_futility_margin(
                 search_depth,
                 improving,
+                opponent_worsening,
                 correction,
                 tt_move,
                 tt_bound,
@@ -1805,8 +1823,26 @@ struct Searcher {
         }
 #endif
 
+        // Small ProbCut: zero-cost TT-based cutoff.
+        // If TT already has a high lower-bound entry far above beta,
+        // we can return immediately without generating any moves.
+        {
+            constexpr int SMALL_PROBCUT_MARGIN = 416;
+            const int small_probcut_beta = beta + SMALL_PROBCUT_MARGIN;
+            if (!pv_node && probe.hit
+                && tt_bound == memory::BOUND_LOWER
+                && probe.data.depth >= search_depth - 4
+                && probed_tt_score >= small_probcut_beta
+                && !is_mate_window(beta)
+                && !is_mate_window(probed_tt_score)) {
+                return small_probcut_beta;
+            }
+        }
+
         const Move prev_move = (ply > 0) ? move_stack[ply - 1] : Move(0);
         const Move prev2_move = (ply > 1) ? move_stack[ply - 2] : Move(0);
+        const Move prev3_move = (ply > 2) ? move_stack[ply - 3] : Move(0);
+        const Move prev4_move = (ply > 3) ? move_stack[ply - 4] : Move(0);
         QuietControl quiet_control{};
         if (!pv_node && !checked) {
             int node_history_signal = 0;
@@ -2006,15 +2042,39 @@ struct Searcher {
             }
 #endif
 
+            // Capture futility pruning: even with the captured piece value,
+            // the position cannot reach alpha at shallow LMR depth.
             if (!pv_node &&
                 !checked &&
-                search_depth <= SEE_PRUNE_DEPTH_LIMIT &&
                 simple_capture &&
-                move_index > 1 &&
-                !search::see_ge(pos, mem, move, -60 * search_depth)) {
-                // Bad capture pruning: skip late captures that fail a SEE threshold.
-                continue;
+                !ensure_gives_check() &&
+                search_depth <= 7) {
+                const PieceType captured_pt = move_is_ep(move) ? PAWN : piece_type_on(pos, to_sq(move));
+                const int captured_value = is_ok(captured_pt) ? piece_order_value[captured_pt] : 0;
+                const int cap_futility = static_eval + 218 + 223 * search_depth
+                    + captured_value + 131 * capture_history_score / 1024;
+                if (cap_futility <= alpha)
+                    continue;
             }
+
+            // Bad capture pruning with dynamic SEE threshold:
+            // capture history adjusts the threshold — good captures are harder to prune.
+            if (!pv_node &&
+                !checked &&
+                simple_capture &&
+                move_index > 1) {
+                const int see_margin = std::max(167 * search_depth + capture_history_score * 34 / 1024, 0);
+                if (!search::see_ge(pos, mem, move, -see_margin))
+                    continue;
+            }
+
+            // Combined history for quiet pruning decisions (Stockfish-style):
+            // continuation history (2 ply) + pawn history.
+            const int combined_history = quiet_move
+                ? history_tables.continuation_value_fast(pos, move, prev_move)
+                    + history_tables.continuation_value_fast(pos, move, prev2_move)
+                    + history_tables.pawn_history_value_fast(pos, move)
+                : 0;
 
             if (!pv_node &&
                 !checked &&
@@ -2044,7 +2104,7 @@ struct Searcher {
                 quiet_move &&
                 !ensure_gives_check() &&
                 quiet_count > std::max(2, lmp_limit(search_depth, improving) / 2) &&
-                history_score <= history_prune_threshold(search_depth, improving)) {
+                combined_history <= history_prune_threshold(search_depth, improving)) {
                 // History pruning removes quiets that are both late and historically bad.
                 continue;
             }
@@ -2108,6 +2168,18 @@ struct Searcher {
 #endif
                     }
                 }
+                // Multi-cut pruning: if excluding the TT move still fails high
+                // over beta, multiple moves cut and we can prune the subtree.
+                else if (singular_score >= beta && !is_mate_window(singular_score)) {
+                    return singular_score;
+                }
+                // Negative extensions: TT move is not singular.
+                else if (probed_tt_score >= beta) {
+                    move_extension = -3;
+                }
+                else if (!pv_node && !move_is_none(tt_move)) {
+                    move_extension = -2;
+                }
             }
 #endif
             if (lmr_quiet_candidate || lmr_capture_candidate)
@@ -2115,7 +2187,11 @@ struct Searcher {
             const int continuation_score = quiet_move
                 ? history_tables.continuation_value_fast(pos, move, prev_move)
                     + history_tables.continuation_value_fast(pos, move, prev2_move) / 2
+                    + history_tables.continuation_value_fast(pos, move, prev3_move) / 4
+                    + history_tables.continuation_value_fast(pos, move, prev4_move) / 4
                 : 0;
+            const int pawn_hist_score = quiet_move
+                ? history_tables.pawn_history_value_fast(pos, move) : 0;
             const int countermove_bonus = quiet_move
                 ? history_tables.countermove_bonus_fast(pos, move, prev_move)
                 : 0;
@@ -2268,6 +2344,11 @@ struct Searcher {
                         prev_move,
                         prev2_move
                     );
+                    // Deeper continuation history bonuses for the cutoff move.
+                    if (!move_is_capture(move)) {
+                        history_tables.bonus_continuation_fast(pos, prev3_move, move, std::max(1, depth / 4));
+                        history_tables.bonus_continuation_fast(pos, prev4_move, move, std::max(1, depth / 4));
+                    }
                     if (capture_move)
                         history_tables.penalize_captures_fast(pos, searched_captures, searched_capture_count, move, depth);
                     else {
@@ -2320,9 +2401,12 @@ struct Searcher {
                 history_tables.penalize_captures_fast(pos, searched_captures, searched_capture_count, best_move, hist_depth);
             } else {
                 history_tables.bonus_fast(pos, best_move, hist_depth);
+                history_tables.bonus_pawn_history_fast(pos, best_move, hist_depth);
                 history_tables.penalize_quiets_fast(pos, searched_quiets, searched_quiet_count, best_move, hist_depth);
                 history_tables.bonus_continuation_fast(pos, prev_move, best_move, hist_depth);
                 history_tables.bonus_continuation_fast(pos, prev2_move, best_move, std::max(1, hist_depth / 2));
+                history_tables.bonus_continuation_fast(pos, prev3_move, best_move, std::max(1, hist_depth / 4));
+                history_tables.bonus_continuation_fast(pos, prev4_move, best_move, std::max(1, hist_depth / 4));
                 history_tables.penalize_continuation_quiets_fast(
                     pos,
                     searched_quiets,

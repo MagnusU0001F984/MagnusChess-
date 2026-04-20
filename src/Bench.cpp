@@ -51,7 +51,7 @@ namespace {
 constexpr std::string_view BENCH_SEPARATOR = "===========================";
 constexpr int MAX_SEARCH_THREADS = 512;
 
-constexpr std::array<std::string_view, 8> SEARCH_BENCH_FENS{{
+constexpr std::array<std::string_view, 13> SEARCH_BENCH_FENS{{
     "1rbqk2r/p2pppbp/6p1/3QP3/8/4B3/PPP2PPP/2KR1B1R b k - 2 11",
     "r1bqk2r/p2pppbp/2p3p1/3NP3/8/4B3/PPP2PPP/R2QKB1R b KQkq - 0 9",
     "R4b2/5pkp/1Q2b1p1/1B6/8/8/P1P2PPP/1K2R3 b - - 2 21",
@@ -59,7 +59,12 @@ constexpr std::array<std::string_view, 8> SEARCH_BENCH_FENS{{
     "r1bqkb1r/pppp2pp/8/1B3p2/3Qn3/8/PPP2PPP/RNB1R1K1 b kq - 0 8",
     "r3k2r/pp4pp/2p1b3/2b5/8/7P/P2q1PP1/1R4K1 w kq - 1 19",
     "r3kb1r/pp4pp/2p1b3/8/8/2N1B3/Pq3PPP/2R3K1 w kq - 0 16",
-    "r3kb1r/pp4pp/2p1b3/8/8/2q5/P2B1PPP/1R4K1 b kq - 1 17"
+    "2rr1k2/4ppb1/2p3p1/p1P1PbNp/3N1BnP/P7/1P3PP1/2RR2K1 w - - 4 23",
+    "r3kb1r/pp4pp/2p1b3/8/8/2q5/P2B1PPP/1R4K1 b kq - 1 17",
+    "4k3/4ppb1/6p1/N1r1PbNp/5BnP/P7/1P3PP1/3R2K1 w - - 0 26",
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    "r4rk1/ppp1qppp/1b3n2/8/3nP1b1/1BNN4/PPPP1PPP/R1B1QRK1 b - - 6 11",
+    "r4rk1/ppp1qppp/1b3n2/8/4P3/1BNN1b1P/PPPP1P2/R1B1QRK1 b - - 0 13",
 }};
 
 struct SearchBenchResult {
