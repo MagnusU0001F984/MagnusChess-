@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <cstddef>
@@ -32,7 +38,7 @@ SOFTWARE.
 #include "Memory.h"
 #include "Position.h"
 
-namespace valerain {
+namespace magnus {
 
 /*
 Perft is used to validate move generation by counting legal move trees exactly.
@@ -41,6 +47,12 @@ This file also exposes a small benchmarking surface for move-generator speed.
 
 using NodeCount = std::uint64_t;
 
+/*
+ * Perft 模組公開介面
+ * PerftDivideRow — 分割輸出的單行（著法/節點數/耗時）
+ * GenSpeedResult — 著法生成器速度基準測試結果
+ * perft/perft_mt/divide/benchmark_generation — 核心 API
+ */
 struct PerftDivideRow {
     int index = 0;
     std::string move;
@@ -79,4 +91,4 @@ GenSpeedResult benchmark_generation(
     std::uint64_t iterations
 );
 
-} // namespace valerain
+} // namespace magnus

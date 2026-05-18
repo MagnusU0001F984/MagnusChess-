@@ -34,7 +34,12 @@ black pieces reuse the same values by flipping squares vertically with sq ^ 56.
 
 #include <array>
 
-namespace valerain::eval {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus::eval {
 
 namespace {
 
@@ -274,4 +279,4 @@ Score evaluate(const Position& pos) noexcept {
     return pos.side_to_move == WHITE ? white_pov : -white_pov;
 }
 
-} // namespace valerain::eval
+} // namespace magnus::eval

@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Nnue.cpp` 实现了 ValerainChess 引擎的 **NNUE（Efficiently Updatable Neural Network）** 评估函数。NNUE 是一种高度优化的神经网络架构，专为国际象棋引擎设计，能在 CPU 上实现极快的增量评估。
+`Nnue.cpp` 实现了 MagnusChess 引擎的 **NNUE（Efficiently Updatable Neural Network）** 评估函数。NNUE 是一种高度优化的神经网络架构，专为国际象棋引擎设计，能在 CPU 上实现极快的增量评估。
 
 ### 网络架构
 
@@ -48,7 +48,7 @@ NNUE 的核心优势在于**高效增量更新（Efficiently Updatable）**：
 支持两种格式：
 | 格式 | 扩展名 | 描述 |
 |------|--------|------|
-| 原生格式 | `.nnue` | ValerainChess 自有网络格式 |
+| 原生格式 | `.nnue` | MagnusChess 自有网络格式 |
 | Bullet 量化 | `.bin` | 量化网络格式，`NetworkFileQuantized` |
 
 `NnueNetwork` 结构体存储所有权重和偏置，通过 `load_nnue_network()` 加载。
@@ -100,7 +100,7 @@ else:
 ## English
 
 ### Overview
-`Nnue.cpp` implements the **NNUE (Efficiently Updatable Neural Network)** evaluation function for the ValerainChess engine. NNUE is a highly optimized neural network architecture designed for chess engines, capable of extremely fast incremental evaluation on CPU.
+`Nnue.cpp` implements the **NNUE (Efficiently Updatable Neural Network)** evaluation function for the MagnusChess engine. NNUE is a highly optimized neural network architecture designed for chess engines, capable of extremely fast incremental evaluation on CPU.
 
 ### Network Architecture
 
@@ -145,7 +145,7 @@ The core advantage of NNUE lies in **efficient incremental updates**:
 Supports two formats:
 | Format | Extension | Description |
 |--------|-----------|-------------|
-| Native | `.nnue` | ValerainChess proprietary network format |
+| Native | `.nnue` | MagnusChess proprietary network format |
 | Bullet quantized | `.bin` | Quantized network format, `NetworkFileQuantized` |
 
 The `NnueNetwork` struct stores all weights and biases, loaded via `load_nnue_network()`.

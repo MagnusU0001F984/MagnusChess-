@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Position.cpp` 实现了 ValerainChess 引擎的棋盘状态表示与操作。它采用混合架构，将邮箱数组（mailbox）、位棋盘（bitboard）、增量评估和 Zobrist 哈希结合为一体，支持完整的走法执行与撤销。
+`Position.cpp` 实现了 MagnusChess 引擎的棋盘状态表示与操作。它采用混合架构，将邮箱数组（mailbox）、位棋盘（bitboard）、增量评估和 Zobrist 哈希结合为一体，支持完整的走法执行与撤销。
 
 ### 核心架构
 
@@ -67,7 +67,7 @@
 ## English
 
 ### Overview
-`Position.cpp` implements the board state representation and operations for the ValerainChess engine. It uses a hybrid architecture combining mailbox arrays, bitboards, incremental evaluation, and Zobrist hashing, supporting full move execution and undo.
+`Position.cpp` implements the board state representation and operations for the MagnusChess engine. It uses a hybrid architecture combining mailbox arrays, bitboards, incremental evaluation, and Zobrist hashing, supporting full move execution and undo.
 
 ### Core Architecture
 

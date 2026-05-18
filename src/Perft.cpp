@@ -35,7 +35,12 @@ SOFTWARE.
 #include <thread>
 #include <vector>
 
-namespace valerain {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus {
 namespace {
 
 /*
@@ -297,6 +302,13 @@ void expand_frontier_once(
 
 } // namespace
 
+/*
+ * Perft (效能測試) 實作
+ * perft() — 單線程遞歸節點計數（用於正確性驗證）
+ * perft_mt() — 多線程並行 Perft
+ * divide() — 互動式分割輸出（每個根著法分開計數）
+ * benchmark_generation() — 著法生成器原始速度基準測試
+ */
 NodeCount perft(const Position& pos, const memory::Memory& mem, int depth) {
     return perft_serial(pos, mem, depth);
 }
@@ -423,4 +435,4 @@ GenSpeedResult benchmark_generation(
     return r;
 }
 
-} // namespace valerain
+} // namespace magnus

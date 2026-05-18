@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Search.cpp` 是 ValerainChess 引擎的核心——完整的**搜索引擎**实现（约 135KB）。它实现了主变例搜索（PVS）、Alpha-Beta 剪枝，以及数十种现代搜索优化技术。
+`Search.cpp` 是 MagnusChess 引擎的核心——完整的**搜索引擎**实现（约 135KB）。它实现了主变例搜索（PVS）、Alpha-Beta 剪枝，以及数十种现代搜索优化技术。
 
 ### 核心架构
 
@@ -195,7 +195,7 @@ pvs(alpha, beta, depth, ply, cut_node):
 ## English
 
 ### Overview
-`Search.cpp` is the core of the ValerainChess engine — the complete **search engine** implementation (~135KB). It implements Principal Variation Search (PVS) with Alpha-Beta pruning and dozens of modern search optimization techniques.
+`Search.cpp` is the core of the MagnusChess engine — the complete **search engine** implementation (~135KB). It implements Principal Variation Search (PVS) with Alpha-Beta pruning and dozens of modern search optimization techniques.
 
 ### Core Architecture
 

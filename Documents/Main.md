@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Main.cpp` 是 ValerainChess 国际象棋引擎的入口文件。它负责解析命令行参数，然后根据子命令将控制流分派到对应的子系统。
+`Main.cpp` 是 MagnusChess 国际象棋引擎的入口文件。它负责解析命令行参数，然后根据子命令将控制流分派到对应的子系统。
 
 ### 核心功能
 
@@ -27,7 +27,7 @@
 ## English
 
 ### Overview
-`Main.cpp` is the entry point of the ValerainChess chess engine. It parses command-line arguments and dispatches control flow to the corresponding subsystem based on the subcommand.
+`Main.cpp` is the entry point of the MagnusChess chess engine. It parses command-line arguments and dispatches control flow to the corresponding subsystem based on the subcommand.
 
 ### Core Functionality
 

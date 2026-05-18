@@ -29,13 +29,15 @@ SOFTWARE.
 
 #include "See.h"
 
-namespace valerain::search {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus::search {
 
 namespace {
 
-constexpr int piece_order_value[PIECE_TYPE_NB] = {
-    100, 320, 330, 500, 900, 0
-};
 constexpr int MAX_TOP_HISTORY_QUIETS = 8;
 
 [[nodiscard]] inline int mvv_lva_capture_term(
@@ -51,6 +53,16 @@ constexpr int MAX_TOP_HISTORY_QUIETS = 8;
 
 } // namespace
 
+/*
+ * MovePicker 實作 — 分階段惰性著法產生與排序
+ * prepare_tt_move() — 驗證 TT 著法合法性並計算評分
+ * build_capture_stage() — 生成捕獲、計算 SEE、分為好/壞捕獲
+ * build_quiet_stage() — 生成安靜著法、排序、應用 QuietControl 抑制
+ * add_capture/add_quiet() — 將著法加入對應列表（處理殺手著法檢測）
+ * pick_best_entry() — 惰性選擇排序（O(n²) 部分排序，每步選最佳）
+ * score_capture() — MVV-LVA + 捕獲歷史 + SEE 偏差項
+ * score_quiet() — 安靜著法歷史排序分數（含延續歷史 + 反著獎勵）
+ */
 MovePicker::MovePicker(
     Position& pos,
     const memory::Memory& mem,
@@ -412,4 +424,4 @@ MovePicker::ScoredEntry MovePicker::pick_best_entry(
     return list[index++];
 }
 
-} // namespace valerain::search
+} // namespace magnus::search

@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Bench.cpp` 实现了 ValerainChess 引擎的**基准测试（Benchmark）** 系统。通过在一组预定义的国际象棋局面上运行固定深度或固定时间的搜索，量化引擎的搜索速度和性能。
+`Bench.cpp` 实现了 MagnusChess 引擎的**基准测试（Benchmark）** 系统。通过在一组预定义的国际象棋局面上运行固定深度或固定时间的搜索，量化引擎的搜索速度和性能。
 
 ### 核心架构
 
@@ -29,7 +29,7 @@
 
 从 CLI 参数解析基准测试参数：
 ```
-valerain bench [depth <d>] [time <ms>] [threads <n>] [hash <mb>]
+magnus bench [depth <d>] [time <ms>] [threads <n>] [hash <mb>]
 ```
 
 ### 搜索基准测试流程（`run_search_bench()`）
@@ -74,7 +74,7 @@ Total: 16000000 nodes 16000 ms 1000000 nps
 ## English
 
 ### Overview
-`Bench.cpp` implements the **benchmark** system for the ValerainChess engine. By running fixed-depth or fixed-time searches on a set of predefined chess positions, it quantifies the engine's search speed and performance.
+`Bench.cpp` implements the **benchmark** system for the MagnusChess engine. By running fixed-depth or fixed-time searches on a set of predefined chess positions, it quantifies the engine's search speed and performance.
 
 ### Core Architecture
 
@@ -100,7 +100,7 @@ These positions come from Stockfish's benchmark set, ensuring comparability betw
 
 Parses benchmark parameters from CLI arguments:
 ```
-valerain bench [depth <d>] [time <ms>] [threads <n>] [hash <mb>]
+magnus bench [depth <d>] [time <ms>] [threads <n>] [hash <mb>]
 ```
 
 ### Search Benchmark Flow (`run_search_bench()`)

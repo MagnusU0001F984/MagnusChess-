@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Nmp.cpp` 实现了 ValerainChess 引擎的**空走裁剪（Null Move Pruning, NMP）** 系统。NMP 是一种高效的搜索优化技术，通过让对手"连走两步"来检测当前局面是否好得不需要仔细搜索。
+`Nmp.cpp` 实现了 MagnusChess 引擎的**空走裁剪（Null Move Pruning, NMP）** 系统。NMP 是一种高效的搜索优化技术，通过让对手"连走两步"来检测当前局面是否好得不需要仔细搜索。
 
 ### 算法原理
 
@@ -79,7 +79,7 @@ pvs(alpha, beta, depth, ply) {
 ## English
 
 ### Overview
-`Nmp.cpp` implements the **Null Move Pruning (NMP)** system for the ValerainChess engine. NMP is an efficient search optimization technique that detects whether the current position is good enough to skip detailed search by letting the opponent "move twice."
+`Nmp.cpp` implements the **Null Move Pruning (NMP)** system for the MagnusChess engine. NMP is an efficient search optimization technique that detects whether the current position is good enough to skip detailed search by letting the opponent "move twice."
 
 ### Algorithm Principle
 

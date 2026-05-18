@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <algorithm>
@@ -33,7 +39,7 @@ SOFTWARE.
 #include "Types.h"
 #include "Tables.h"
 
-namespace valerain::memory {
+namespace magnus::memory {
 
 /*
 The transposition table is organized as fixed-size 64-byte clusters with four
@@ -41,14 +47,14 @@ lanes each. That layout keeps probe/store traffic cache friendly while still
 allowing a simple depth-and-age replacement policy.
 */
 
-using ::valerain::u8;
-using ::valerain::u16;
-using ::valerain::u32;
-using ::valerain::u64;
-using ::valerain::i16;
-using ::valerain::Move;
-using ::valerain::Key;
-using ::valerain::mix64;
+using ::magnus::u8;
+using ::magnus::u16;
+using ::magnus::u32;
+using ::magnus::u64;
+using ::magnus::i16;
+using ::magnus::Move;
+using ::magnus::Key;
+using ::magnus::mix64;
 
 enum Bound : u8 {
     BOUND_NONE  = 0,
@@ -136,4 +142,4 @@ void tt_save(
 
 [[nodiscard]] int tt_hashfull(const TT& tt, int max_age = 0) noexcept;
 
-} // namespace valerain::memory
+} // namespace magnus::memory

@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`MovePicker.cpp` 实现了 ValerainChess 的分阶段走法选择器。`MovePicker` 负责从走法列表中按优先级顺序逐一产生走法，涵盖从置换表走法到坏吃子的完整排序流水线。
+`MovePicker.cpp` 实现了 MagnusChess 的分阶段走法选择器。`MovePicker` 负责从走法列表中按优先级顺序逐一产生走法，涵盖从置换表走法到坏吃子的完整排序流水线。
 
 ### 分阶段架构
 
@@ -29,7 +29,7 @@
 #### 安静走法排序
 安静走法的得分由 `quiet_ordering_score_fast()` 计算，由五项组成：
 1. **安静走法历史**（权重 1）— from→to 的历史得分
-2. **反走法奖励**（权重 1/1）— 上一步走法对应的反走法匹配奖励（`VALERAIN_COUNTERMOVE_BONUS = 4096`）
+2. **反走法奖励**（权重 1/1）— 上一步走法对应的反走法匹配奖励（`MAGNUS_COUNTERMOVE_BONUS = 4096`）
 3. **延续历史 1**（权重 1/1）— (prev_piece, prev_to) → (cur_piece, cur_to)
 4. **延续历史 2**（权重 1/4）— (prev2_piece, prev2_to) → (cur_piece, cur_to)，衰减更多
 5. **兵形历史**（权重 1）— 兵形哈希 × 棋子类型 × 目标格
@@ -60,7 +60,7 @@
 ## English
 
 ### Overview
-`MovePicker.cpp` implements ValerainChess's staged move selector. `MovePicker` is responsible for producing moves one by one from move lists in priority order, covering the complete ordering pipeline from TT move to bad captures.
+`MovePicker.cpp` implements MagnusChess's staged move selector. `MovePicker` is responsible for producing moves one by one from move lists in priority order, covering the complete ordering pipeline from TT move to bad captures.
 
 ### Staged Architecture
 
@@ -86,7 +86,7 @@ In **qsearch** mode, stages 2-4 are skipped (quiet moves are not searched).
 #### Quiet Move Ordering
 The score for quiet moves is computed by `quiet_ordering_score_fast()`, consisting of five terms:
 1. **Quiet history** (weight 1) — from→to history score
-2. **Countermove bonus** (weight 1/1) — match bonus for the countermove of the previous move (`VALERAIN_COUNTERMOVE_BONUS = 4096`)
+2. **Countermove bonus** (weight 1/1) — match bonus for the countermove of the previous move (`MAGNUS_COUNTERMOVE_BONUS = 4096`)
 3. **Continuation history 1** (weight 1/1) — (prev_piece, prev_to) → (cur_piece, cur_to)
 4. **Continuation history 2** (weight 1/4) — (prev2_piece, prev2_to) → (cur_piece, cur_to), more decayed
 5. **Pawn history** (weight 1) — pawn hash × piece type × target square

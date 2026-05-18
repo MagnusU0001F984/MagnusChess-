@@ -27,8 +27,20 @@ SOFTWARE.
 #include <algorithm>
 #include <cstring>
 
-namespace valerain::search {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
 
+namespace magnus::search {
+
+/*
+ * 歷史啟發式實作
+ * depth_class() — 將深度映射到 Shallow/MediumLow/MediumHigh/Deep 類別
+ * classify_see() — 將 SEE 值分類（LossBig/LossSmall/Equal/GainSmall/GainBig/Promo/Check）
+ * history_bonus/penalty() — 計算歷史權重更新量（bonus=d², penalty=4d²）
+ * see_immediate_term() — SEE 的立即評分項（按 Weak/Medium/Strong 預設縮放）
+ */
 DepthClass depth_class(int depth) noexcept {
     if (depth <= 3) return DepthClass::Shallow;
     if (depth <= 6) return DepthClass::MediumLow;
@@ -47,11 +59,11 @@ SeeClass classify_see(int see_value, bool gives_check, bool is_promotion) noexce
 }
 
 SeeClass classify_see_bias(int see_value) noexcept {
-    if (see_value < VALERAIN_SEE_BIAS_BAD_THRESHOLD)
+    if (see_value < MAGNUS_SEE_BIAS_BAD_THRESHOLD)
         return SeeClass::LossSmall;
-    if (see_value > VALERAIN_SEE_BIAS_GOOD_BIG_THRESHOLD)
+    if (see_value > MAGNUS_SEE_BIAS_GOOD_BIG_THRESHOLD)
         return SeeClass::GainBig;
-    if (see_value > VALERAIN_SEE_BIAS_EQ_THRESHOLD)
+    if (see_value > MAGNUS_SEE_BIAS_EQ_THRESHOLD)
         return SeeClass::GainSmall;
     return SeeClass::Equal;
 }
@@ -88,4 +100,4 @@ void HistoryTables::clear() noexcept {
     pawn_history = {};
 }
 
-} // namespace valerain::search
+} // namespace magnus::search

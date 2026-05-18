@@ -28,32 +28,50 @@ SOFTWARE.
 #include <atomic>
 #include <chrono>
 #include <charconv>
-#include <cctype>
 #include <filesystem>
 #include <limits>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
-#include <streambuf>
 #include <thread>
 
 #include "Attack.h"
 #include "Bench.h"
+#include "Common.h"
 #include "Evaluation.h"
 #include "Memory.h"
-#include "MoveGen.h"
 #include "Nnue.h"
 #include "Search.h"
 #include "Time.h"
 
 /*
-This file implements the engine's minimal UCI front-end. It parses commands,
-builds positions from startpos/FEN input, manages hash and NNUE options, and
-derives practical search limits from the UCI go command.
-*/
+ * MagnusChess UCI 前端 — Universal Chess Interface 實作
+ *
+ * 完整的 UCI 協定實作，包含以下功能模組：
+ *
+ * 1. UCI 命令解析與派發
+ *    - uci / isready / ucinewgame / quit — 標準 UCI 握手
+ *    - position [startpos|fen ...] [moves ...] — 局面設定
+ *    - go [depth|movetime|wtime|btime|...] — 搜尋控制
+ *    - stop / ponderhit — 非同步搜尋控制
+ *    - setoption name [Hash|Threads|EvalFile|...] value — 引擎選項
+ *
+ * 2. FEN 解析 (parse_fen)
+ *    - 驗證棋盤結構、走子方、易位權、過路兵
+ *    - 通過標準 piece-placement API 建構局面
+ *
+ * 3. 搜尋線程管理 (UciSession)
+ *    - 合作式停止 (stop_requested 原子變量)
+ *    - 沉思模式支援 (ponder / ponderhit 時間追蹤)
+ *    - 背景 NNUE 預加載
+ *
+ * 4. PvTrackingStreamBuf — 自訂 streambuf
+ *    - 攔截搜尋輸出的 "info ... pv ..." 行
+ *    - 提取 PV 用於沉思著法計算
+ */
 
-namespace valerain {
+namespace magnus {
 
 namespace {
 
@@ -66,10 +84,12 @@ constexpr int MAX_UCI_CONTEMPT = 10000;
 struct PositionHistory {
     Key keys[search::MAX_GAME_HISTORY]{};
     int count = 0;
+    int head = 0; // circular-buffer write cursor
 };
 
 inline void clear_position_history(PositionHistory& history) noexcept {
     history.count = 0;
+    history.head = 0;
 }
 
 inline void push_position_history(
@@ -77,13 +97,13 @@ inline void push_position_history(
     Key key
 ) noexcept {
     if (history.count < search::MAX_GAME_HISTORY) {
-        history.keys[history.count++] = key;
+        history.keys[history.count] = key;
+        ++history.count;
         return;
     }
-
-    for (int i = 1; i < search::MAX_GAME_HISTORY; ++i)
-        history.keys[i - 1] = history.keys[i];
-    history.keys[search::MAX_GAME_HISTORY - 1] = key;
+    // Circular overwrite: O(1) instead of O(n) shift.
+    history.keys[history.head] = key;
+    history.head = (history.head + 1) % search::MAX_GAME_HISTORY;
 }
 
 [[nodiscard]] constexpr const char* go_usage_hint() noexcept {
@@ -129,34 +149,6 @@ inline void push_position_history(
     ).count();
 }
 
-[[nodiscard]] std::string default_eval_file() {
-    // Prefer the repo-root bundled default, then fall back to in-tree legacy paths.
-    constexpr const char* preferred = "Evalfile.bin";
-    if (std::filesystem::exists(preferred))
-        return preferred;
-
-    constexpr const char* candidates[] = {
-        "src/bin/quantised.bin",
-        "NnueFile/nn-2a5d6101d177.nnue",
-        "src/NnueFile/nn-2a5d6101d177.nnue",
-        "NnueFile/nn-37f18f62d772.nnue",
-        "src/NnueFile/nn-37f18f62d772.nnue"
-    };
-
-    for (const char* candidate : candidates)
-        if (std::filesystem::exists(candidate))
-            return candidate;
-
-    return preferred;
-}
-
-[[nodiscard]] bool parse_int(std::string_view sv, int& value) noexcept {
-    const char* first = sv.data();
-    const char* last = sv.data() + sv.size();
-    const auto [ptr, ec] = std::from_chars(first, last, value);
-    return ec == std::errc{} && ptr == last;
-}
-
 [[nodiscard]] bool parse_u64(std::string_view sv, u64& value) noexcept {
     const char* first = sv.data();
     const char* last = sv.data() + sv.size();
@@ -176,296 +168,6 @@ inline void push_position_history(
     }
 
     return false;
-}
-
-[[nodiscard]] bool parse_square(std::string_view sv, Square& sq) noexcept {
-    if (sv.size() != 2)
-        return false;
-
-    const char file = sv[0];
-    const char rank = sv[1];
-    if (file < 'a' || file > 'h' || rank < '1' || rank > '8')
-        return false;
-
-    sq = static_cast<Square>((rank - '1') * 8 + (file - 'a'));
-    return true;
-}
-
-[[nodiscard]] bool parse_piece_char(
-    char c,
-    Color& color,
-    PieceType& piece_type
-) noexcept {
-    // FEN pieces use case to encode color and the letter to encode piece type.
-    color = std::isupper(static_cast<unsigned char>(c)) ? WHITE : BLACK;
-
-    switch (static_cast<char>(std::tolower(static_cast<unsigned char>(c)))) {
-        case 'p': piece_type = PAWN; return true;
-        case 'n': piece_type = KNIGHT; return true;
-        case 'b': piece_type = BISHOP; return true;
-        case 'r': piece_type = ROOK; return true;
-        case 'q': piece_type = QUEEN; return true;
-        case 'k': piece_type = KING; return true;
-        default: return false;
-    }
-}
-
-[[nodiscard]] bool move_matches_uci(Move move, std::string_view token) noexcept {
-    if (token.size() != 4 && token.size() != 5)
-        return false;
-
-    if (token[0] != static_cast<char>('a' + file_of(from_sq(move))) ||
-        token[1] != static_cast<char>('1' + rank_of(from_sq(move))) ||
-        token[2] != static_cast<char>('a' + file_of(to_sq(move))) ||
-        token[3] != static_cast<char>('1' + rank_of(to_sq(move)))) {
-        return false;
-    }
-
-    if (!move_is_promotion(move))
-        return token.size() == 4;
-
-    if (token.size() != 5)
-        return false;
-
-    switch (promo_piece(move)) {
-        case KNIGHT: return token[4] == 'n';
-        case BISHOP: return token[4] == 'b';
-        case ROOK:   return token[4] == 'r';
-        case QUEEN:  return token[4] == 'q';
-        default:     return false;
-    }
-}
-
-[[nodiscard]] bool find_uci_move(
-    const Position& pos,
-    const memory::Memory& mem,
-    std::string_view token,
-    Move& move
-) noexcept {
-    // UCI moves are matched by generating legal moves and comparing the text form.
-    MoveList list{};
-    generate_legal(pos, mem, list);
-
-    for (int i = 0; i < list.size; ++i) {
-        if (move_matches_uci(list.moves[i], token)) {
-            move = list.moves[i];
-            return true;
-        }
-    }
-
-    return false;
-}
-
-class PvTrackingStreamBuf final : public std::streambuf {
-public:
-    explicit PvTrackingStreamBuf(std::streambuf* sink) noexcept
-        : sink_(sink) {}
-
-    ~PvTrackingStreamBuf() override {
-        flush_pending_line();
-    }
-
-    [[nodiscard]] std::string_view last_pv() const noexcept {
-        return last_pv_;
-    }
-
-protected:
-    int overflow(int ch) override {
-        if (ch == traits_type::eof())
-            return sync() == 0 ? traits_type::not_eof(ch) : traits_type::eof();
-
-        const char c = static_cast<char>(ch);
-        append_char(c);
-        if (sink_ == nullptr)
-            return ch;
-
-        const int result = sink_->sputc(c);
-        if (c == '\n')
-            sink_->pubsync();
-        return result;
-    }
-
-    std::streamsize xsputn(
-        const char* s,
-        std::streamsize count
-    ) override {
-        bool saw_newline = false;
-        for (std::streamsize i = 0; i < count; ++i)
-        {
-            append_char(s[i]);
-            saw_newline = saw_newline || s[i] == '\n';
-        }
-
-        if (sink_ == nullptr)
-            return count;
-
-        const std::streamsize written = sink_->sputn(s, count);
-        if (saw_newline)
-            sink_->pubsync();
-        return written;
-    }
-
-    int sync() override {
-        flush_pending_line();
-        return sink_ != nullptr ? sink_->pubsync() : 0;
-    }
-
-private:
-    void append_char(char c) {
-        if (c == '\n') {
-            flush_pending_line();
-            return;
-        }
-
-        if (c != '\r')
-            line_buffer_.push_back(c);
-    }
-
-    void flush_pending_line() {
-        if (line_buffer_.empty())
-            return;
-
-        process_line();
-        line_buffer_.clear();
-    }
-
-    void process_line() {
-        const std::string_view line{line_buffer_};
-        if (line.rfind("info ", 0) != 0)
-            return;
-
-        constexpr std::string_view pv_marker = " pv ";
-        const std::size_t pv_pos = line.find(pv_marker);
-        if (pv_pos == std::string_view::npos)
-            return;
-
-        const std::size_t pv_begin = pv_pos + pv_marker.size();
-        if (pv_begin >= line.size())
-            return;
-
-        last_pv_.assign(line.substr(pv_begin));
-    }
-
-    std::streambuf* sink_ = nullptr;
-    std::string line_buffer_{};
-    std::string last_pv_{};
-};
-
-[[nodiscard]] std::string ponder_move_from_last_pv(
-    const Position& root,
-    const memory::Memory& mem,
-    Move best_move,
-    std::string_view last_pv
-) noexcept {
-    if (move_is_none(best_move) || last_pv.empty())
-        return {};
-
-    std::istringstream pv_stream{std::string(last_pv)};
-    std::string best_token;
-    std::string ponder_token;
-    if (!(pv_stream >> best_token >> ponder_token))
-        return {};
-
-    Move pv_best_move = 0;
-    if (!find_uci_move(root, mem, best_token, pv_best_move) ||
-        pv_best_move != best_move) {
-        return {};
-    }
-
-    Position after_best = root;
-    do_move_copy(after_best, best_move, mem.tables);
-
-    Move ponder_move = 0;
-    if (!find_uci_move(after_best, mem, ponder_token, ponder_move))
-        return {};
-
-    return search::move_to_uci(ponder_move);
-}
-
-[[nodiscard]] bool parse_fen(
-    Position& pos,
-    const memory::Memory& mem,
-    const std::string& fen
-) noexcept {
-    // FEN parsing rebuilds the position through the regular piece-placement API
-    // so mailbox, bitboards, eval caches, and king-square caches all stay aligned.
-    std::istringstream iss(fen);
-
-    std::string board_part;
-    std::string stm_part;
-    std::string castling_part;
-    std::string ep_part;
-    std::string halfmove_part = "0";
-    std::string fullmove_part = "1";
-
-    if (!(iss >> board_part >> stm_part >> castling_part >> ep_part))
-        return false;
-
-    iss >> halfmove_part >> fullmove_part;
-
-    position_clear(pos);
-
-    int rank = 7;
-    int file = 0;
-
-    for (char c : board_part) {
-        if (c == '/') {
-            if (file != 8 || rank == 0)
-                return false;
-
-            --rank;
-            file = 0;
-            continue;
-        }
-
-        if (c >= '1' && c <= '8') {
-            file += c - '0';
-            if (file > 8)
-                return false;
-            continue;
-        }
-
-        Color color = WHITE;
-        PieceType piece_type = PAWN;
-        if (!parse_piece_char(c, color, piece_type) || file >= 8)
-            return false;
-
-        position_put_piece(pos, color, piece_type, rank * 8 + file);
-        ++file;
-    }
-
-    if (rank != 0 || file != 8)
-        return false;
-
-    if (stm_part == "w") pos.side_to_move = WHITE;
-    else if (stm_part == "b") pos.side_to_move = BLACK;
-    else return false;
-
-    pos.castling_rights = NO_CASTLING;
-    if (castling_part != "-") {
-        for (char c : castling_part) {
-            switch (c) {
-                case 'K': pos.castling_rights |= WHITE_OO; break;
-                case 'Q': pos.castling_rights |= WHITE_OOO; break;
-                case 'k': pos.castling_rights |= BLACK_OO; break;
-                case 'q': pos.castling_rights |= BLACK_OOO; break;
-                default: return false;
-            }
-        }
-    }
-
-    pos.ep_sq = NO_SQ;
-    if (ep_part != "-" && !parse_square(ep_part, pos.ep_sq))
-        return false;
-
-    if (!parse_int(halfmove_part, pos.halfmove_clock) || pos.halfmove_clock < 0)
-        return false;
-
-    if (!parse_int(fullmove_part, pos.fullmove_number) || pos.fullmove_number <= 0)
-        return false;
-
-    position_refresh_key(pos, mem.tables);
-    return position_has_valid_kings(pos) && position_board_matches_bitboards(pos);
 }
 
 [[nodiscard]] bool apply_move_list(
@@ -536,24 +238,6 @@ private:
     return apply_move_list(pos, mem, iss, history);
 }
 
-[[nodiscard]] bool ensure_nnue_loaded(
-    const std::string& eval_file,
-    std::ostream* out
-) {
-    // Load lazily so HCE remains usable even when no NNUE file is configured.
-    if (nnue::loaded() && nnue::path() == eval_file)
-        return true;
-
-    if (nnue::load(eval_file)) {
-        if (out)
-            *out << "info string loaded nnue " << eval_file << '\n';
-        return true;
-    }
-
-    if (out)
-        *out << "info string failed to load nnue: " << nnue::last_error() << '\n';
-    return false;
-}
 
 [[nodiscard]] const char* active_eval_name(bool use_nnue) noexcept {
     return use_nnue && nnue::loaded() ? "nnue" : "hce";
@@ -580,89 +264,6 @@ private:
         .loss = stm_wdl.win
     };
 }
-
-void handle_setoption(
-    memory::Memory& mem,
-    bool& use_nnue,
-    bool& enable_ponder,
-    int& threads,
-    int& contempt,
-    std::string& eval_file,
-    std::ostream& out,
-    std::string_view command
-) {
-    // Option parsing is intentionally small: hash size, threading, contempt,
-    // search toggles, and NNUE file path are all that the engine exposes.
-    std::istringstream iss{std::string(command)};
-    std::string token;
-    std::string name;
-    std::string value;
-
-    iss >> token; // setoption
-    iss >> token; // name
-
-    while (iss >> token) {
-        if (token == "value")
-            break;
-
-        if (!name.empty())
-            name.push_back(' ');
-        name += token;
-    }
-
-    std::getline(iss, value);
-    if (!value.empty() && value.front() == ' ')
-        value.erase(value.begin());
-
-    if (name == "Hash") {
-        int mb = 0;
-        if (parse_int(value, mb) && mb > 0)
-            memory::tt_resize_mb(mem.tt, static_cast<std::size_t>(mb));
-    }
-    else if (name == "Threads") {
-        int parsed_threads = 0;
-        if (parse_int(value, parsed_threads))
-            threads = std::clamp(parsed_threads, 1, MAX_UCI_THREADS);
-    }
-    else if (name == "Contempt") {
-        int parsed_contempt = 0;
-        if (parse_int(value, parsed_contempt)) {
-            const int clamped = std::clamp(parsed_contempt, MIN_UCI_CONTEMPT, MAX_UCI_CONTEMPT);
-            if (contempt != clamped)
-                memory::memory_clear_hash(mem);
-            contempt = clamped;
-        }
-    }
-    else if (name == "Clear Hash") {
-        memory::memory_clear_hash(mem);
-    }
-    else if (name == "UseNNUE") {
-        bool parsed = false;
-        if (parse_bool(value, parsed)) {
-            if (use_nnue != parsed)
-                memory::memory_clear_hash(mem);
-
-            use_nnue = parsed;
-            if (use_nnue && !ensure_nnue_loaded(eval_file, &out))
-                out << "info string nnue unavailable, search will fall back to hce\n";
-        }
-    }
-    else if (name == "Ponder") {
-        bool parsed = false;
-        if (parse_bool(value, parsed))
-            enable_ponder = parsed;
-    }
-    else if (name == "EvalFile") {
-        if (!value.empty()) {
-            eval_file = value;
-            memory::memory_clear_hash(mem);
-
-            if (use_nnue && !ensure_nnue_loaded(eval_file, &out))
-                out << "info string nnue unavailable, search will fall back to hce\n";
-        }
-    }
-}
-
 [[nodiscard]] bool parse_go_command(
     const Position& pos,
     const memory::Memory& mem,
@@ -836,16 +437,29 @@ struct UciSession {
     std::atomic<int> ponder_time_offset_ms{0};
     std::atomic<long long> search_start_ms{0};
     std::thread search_thread;
+    std::thread nnue_preload_thread;
 
     UciSession() {
         memory::memory_init(mem, 64, 8, 2);
-        attack_init_backend(mem);
+        // attack_init_backend deferred to first command that needs it.
         set_start_position(pos);
         position_refresh_key(pos, mem.tables);
+        // Start NNUE preload in background so the file is ready by the first search.
+        if (use_nnue && !eval_file.empty()) {
+            nnue_preload_thread = std::thread([path = eval_file]() {
+                nnue::load(path);
+            });
+        }
+    }
+
+    void ensure_attack_ready() {
+        attack_init_backend(mem);
     }
 
     ~UciSession() {
         stop_search();
+        if (nnue_preload_thread.joinable())
+            nnue_preload_thread.join();
         memory::memory_free(mem);
     }
 
@@ -888,13 +502,13 @@ struct UciSession {
     }
 
     void emit_banner(std::ostream& out) const {
-        out << "ValerainChess 0.1.1 by the Magnus developer" << std::endl;
+        out << "MagnusChess\U0001F984 0.1.1 by the Magnus developer" << std::endl;
     }
 
     void emit_uci_id(std::ostream& out) const {
-        out << "id name ValerainChess 0.1.0\n";
-        out << "id author Theodore Magnus Oen Nidhar\n";
-        out << "option name Hash type spin default 64 min 1 max 33554432\n";
+        out << "id name MagnusChess 0.1.1\n";
+        out << "id author Magnus\n";
+        out << "option name Hash type spin default 64 min 1 max 1048576\n";
         out << "option name Threads type spin default 1 min 1 max " << MAX_UCI_THREADS << "\n";
         out << "option name Contempt type spin default " << DEFAULT_UCI_CONTEMPT
             << " min " << MIN_UCI_CONTEMPT
@@ -916,8 +530,118 @@ struct UciSession {
 
     void copy_history_to_limits(search::SearchLimits& limits) const {
         limits.game_history_count = position_history.count;
-        for (int i = 0; i < position_history.count; ++i)
-            limits.game_history_keys[i] = position_history.keys[i];
+        if (position_history.count < search::MAX_GAME_HISTORY) {
+            for (int i = 0; i < position_history.count; ++i)
+                limits.game_history_keys[i] = position_history.keys[i];
+            return;
+        }
+        // Circular buffer wrap: copy [head..end] then [0..head-1].
+        const int head = position_history.head;
+        int dst = 0;
+        for (int i = head; i < search::MAX_GAME_HISTORY; ++i)
+            limits.game_history_keys[dst++] = position_history.keys[i];
+        for (int i = 0; i < head; ++i)
+            limits.game_history_keys[dst++] = position_history.keys[i];
+    }
+
+    [[nodiscard]] bool ensure_nnue_loaded(std::ostream* out) {
+        // Wait for any background preload to finish before touching NNUE state.
+        if (nnue_preload_thread.joinable())
+            nnue_preload_thread.join();
+
+        if (nnue::loaded() && nnue::path() == eval_file)
+            return true;
+
+        if (nnue::load(eval_file)) {
+            if (out)
+                *out << "info string loaded nnue " << eval_file << '\n';
+            return true;
+        }
+
+        if (out)
+            *out << "info string failed to load nnue: " << nnue::last_error() << '\n';
+        return false;
+    }
+
+    void handle_setoption(std::ostream& out, std::string_view command) {
+        std::istringstream iss{std::string(command)};
+        std::string token;
+        std::string name;
+        std::string value;
+
+        iss >> token; // setoption
+        iss >> token; // name
+
+        while (iss >> token) {
+            if (token == "value")
+                break;
+
+            if (!name.empty())
+                name.push_back(' ');
+            name += token;
+        }
+
+        std::getline(iss, value);
+        if (!value.empty() && value.front() == ' ')
+            value.erase(value.begin());
+
+        if (name == "Hash") {
+            int mb = 0;
+            if (parse_int(value, mb) && mb > 0) {
+                // Safety cap: prevent OOM crash from -fno-exceptions + huge allocation.
+                constexpr std::size_t MAX_HASH_MB = 1ULL << 20; // 1 TB
+                const std::size_t clamped_mb = std::min(
+                    static_cast<std::size_t>(mb), MAX_HASH_MB);
+                memory::tt_resize_mb(mem.tt, clamped_mb);
+            }
+        }
+        else if (name == "Threads") {
+            int parsed_threads = 0;
+            if (parse_int(value, parsed_threads))
+                threads = std::clamp(parsed_threads, 1, MAX_UCI_THREADS);
+        }
+        else if (name == "Contempt") {
+            int parsed_contempt = 0;
+            if (parse_int(value, parsed_contempt)) {
+                const int clamped = std::clamp(parsed_contempt, MIN_UCI_CONTEMPT, MAX_UCI_CONTEMPT);
+                if (contempt != clamped)
+                    memory::memory_clear_hash(mem);
+                contempt = clamped;
+            }
+        }
+        else if (name == "Clear Hash") {
+            memory::memory_clear_hash(mem);
+        }
+        else if (name == "UseNNUE") {
+            bool parsed = false;
+            if (parse_bool(value, parsed)) {
+                if (use_nnue != parsed)
+                    memory::memory_clear_hash(mem);
+
+                use_nnue = parsed;
+                if (use_nnue && !ensure_nnue_loaded(&out))
+                    out << "info string nnue unavailable, search will fall back to hce\n";
+            }
+        }
+        else if (name == "Ponder") {
+            bool parsed = false;
+            if (parse_bool(value, parsed))
+                enable_ponder = parsed;
+        }
+        else if (name == "EvalFile") {
+            if (!value.empty()) {
+                std::error_code ec;
+                if (!std::filesystem::exists(value, ec) || ec) {
+                    out << "info string EvalFile not found: " << value << '\n';
+                    return;
+                }
+                eval_file = value;
+                memory::memory_clear_hash(mem);
+
+                if (use_nnue && !ensure_nnue_loaded(&out))
+                    out << "info string nnue unavailable, search will fall back to hce\n";
+            }
+        }
     }
 
     void ensure_search_eval_ready(
@@ -926,14 +650,14 @@ struct UciSession {
     ) {
         if (use_nnue &&
             !nnue::loaded() &&
-            !ensure_nnue_loaded(eval_file, &out)) {
+            !ensure_nnue_loaded(&out)) {
             out << fallback_message << '\n';
         }
     }
 
     void handle_eval(std::ostream& out) {
         if (use_nnue && !nnue::loaded())
-            (void)ensure_nnue_loaded(eval_file, nullptr);
+            (void)ensure_nnue_loaded(nullptr);
 
         out << "info string eval " << active_eval_name(use_nnue) << '\n';
         const int hce_stm = eval::evaluate(pos);
@@ -964,6 +688,7 @@ struct UciSession {
     }
 
     void handle_bench(std::string_view line, std::ostream& out) {
+        ensure_attack_ready();
         if (line != "bench") {
             out << "info string usage: " << bench_usage_hint() << '\n';
             return;
@@ -983,6 +708,7 @@ struct UciSession {
     }
 
     void handle_position(std::string_view line, std::ostream& out) {
+        ensure_attack_ready();
         if (!set_position_from_command(
                 pos,
                 mem,
@@ -993,6 +719,7 @@ struct UciSession {
     }
 
     void handle_go(std::string_view line, std::ostream& out) {
+        ensure_attack_ready();
         search::SearchLimits limits{};
         if (!parse_go_command(pos, mem, time_manager, line, limits)) {
             out << "info string usage: " << go_usage_hint() << '\n';
@@ -1019,7 +746,6 @@ struct UciSession {
         search_start_ms.store(steady_now_ms(), std::memory_order_release);
 
         const Position root = pos;
-        search_running.store(true, std::memory_order_release);
         search_thread = std::thread([this, root, limits]() {
             PvTrackingStreamBuf pv_tracking_buf(std::cout.rdbuf());
             std::ostream tracked_out(&pv_tracking_buf);
@@ -1063,9 +789,11 @@ struct UciSession {
             search_start_ms.store(0, std::memory_order_release);
             search_running.store(false, std::memory_order_release);
         });
+        search_running.store(true, std::memory_order_release);
     }
 
     void handle_perft(std::string_view line, std::ostream& out) {
+        ensure_attack_ready();
         int depth = -1;
         std::size_t perft_threads = 0;
         bool live = false;
@@ -1119,16 +847,7 @@ struct UciSession {
         }
 
         if (command_starts_with(line, "setoption")) {
-            handle_setoption(
-                mem,
-                use_nnue,
-                enable_ponder,
-                threads,
-                contempt,
-                eval_file,
-                out,
-                line
-            );
+            handle_setoption(out, line);
             return true;
         }
 
@@ -1169,13 +888,25 @@ int run_uci() {
     UciSession session{};
     session.emit_banner(std::cout);
 
+    constexpr std::size_t MAX_UCI_LINE = 8192;
     std::string line;
-    while (std::getline(std::cin, line)) {
-        if (!session.process_command(line, std::cout))
+    line.reserve(MAX_UCI_LINE);
+    while (true) {
+        line.clear();
+        int ch = 0;
+        while ((ch = std::cin.get()) != std::char_traits<char>::eof() && ch != '\n') {
+            if (line.size() < MAX_UCI_LINE)
+                line.push_back(static_cast<char>(ch));
+        }
+        if (ch == std::char_traits<char>::eof() && line.empty())
+            break;
+        if (line.size() >= MAX_UCI_LINE)
+            std::cout << "info string line too long, ignoring\n";
+        else if (!session.process_command(line, std::cout))
             break;
     }
 
     return 0;
 }
 
-} // namespace valerain
+} // namespace magnus

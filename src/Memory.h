@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <algorithm>
@@ -35,7 +41,7 @@ SOFTWARE.
 #include "Tables.h"
 #include "TT.h"
 
-namespace valerain::memory {
+namespace magnus::memory {
 
 /*
 Memory bundles together all shared engine state that is expensive to allocate
@@ -43,28 +49,28 @@ or initialize repeatedly: attack tables, the transposition table, and auxiliary
 pawn/material hash tables reserved for evaluation-related caching.
 */
 
-using ::valerain::u8;
-using ::valerain::u16;
-using ::valerain::u32;
-using ::valerain::u64;
-using ::valerain::i16;
-using ::valerain::i32;
-using ::valerain::i64;
+using ::magnus::u8;
+using ::magnus::u16;
+using ::magnus::u32;
+using ::magnus::u64;
+using ::magnus::i16;
+using ::magnus::i32;
+using ::magnus::i64;
 
-using ::valerain::Bitboard;
-using ::valerain::Key;
-using ::valerain::Move;
-using ::valerain::Square;
-using ::valerain::Color;
-using ::valerain::PieceType;
-using ::valerain::Tables;
-using ::valerain::mix64;
+using ::magnus::Bitboard;
+using ::magnus::Key;
+using ::magnus::Move;
+using ::magnus::Square;
+using ::magnus::Color;
+using ::magnus::PieceType;
+using ::magnus::Tables;
+using ::magnus::mix64;
 
-using ::valerain::SQ_NB;
-using ::valerain::FILE_NB;
-using ::valerain::RANK_NB;
-using ::valerain::COLOR_NB;
-using ::valerain::PIECE_NB;
+using ::magnus::SQ_NB;
+using ::magnus::FILE_NB;
+using ::magnus::RANK_NB;
+using ::magnus::COLOR_NB;
+using ::magnus::PIECE_NB;
 
 template <typename T>
 inline std::size_t pow2_capacity_from_bytes(std::size_t bytes) noexcept {
@@ -147,6 +153,13 @@ inline void material_table_resize_mb(MaterialTable& t, std::size_t mb) {
     t.mask = count - 1;
 }
 
+/*
+ * Memory — 共享引擎狀態的頂層容器
+ * 包含：Tables(幾何/攻擊/Zobrist)、TT(置換表)、PawnTable(兵快取)、MaterialTable(材料快取)
+ * memory_init() 一次性初始化所有子表
+ * memory_new_search() 在每次新搜索前遞增 TT 世代編號
+ * memory_clear_hash() 清空所有雜湊表（setoption Clear Hash）
+ */
 struct Memory {
     // Shared immutable tables plus mutable hash storage used by search.
     Tables tables{};
@@ -163,7 +176,7 @@ inline void memory_init(
     u64 zobrist_seed = 0xC0FFEE1234567890ULL
 ) {
     if (!mem.tables.initialized)
-        ::valerain::tables_init(mem.tables, zobrist_seed);
+        ::magnus::tables_init(mem.tables, zobrist_seed);
 
     tt_resize_mb(mem.tt, tt_mb);
     pawn_table_resize_mb(mem.pawn, pawn_mb);
@@ -186,4 +199,4 @@ inline void memory_free(Memory& mem) noexcept {
     material_table_free(mem.material);
 }
 
-} // namespace valerain::memory
+} // namespace magnus::memory

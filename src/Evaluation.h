@@ -22,12 +22,18 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include "Position.h"
 #include "Types.h"
 
-namespace valerain::eval {
+namespace magnus::eval {
 
 /*
 The evaluation interface is intentionally small. Position owns the incremental
@@ -59,4 +65,4 @@ void on_piece_moved(
 
 Score evaluate(const Position& pos) noexcept;
 
-} // namespace valerain::eval
+} // namespace magnus::eval

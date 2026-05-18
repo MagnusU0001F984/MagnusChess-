@@ -35,7 +35,12 @@ then uses specialized generators for evasions, non-evasions, and the final
 legality filter.
 */
 
-namespace valerain {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus {
 
 namespace {
 
@@ -956,6 +961,15 @@ Bitboard danger_bb(
     return attacks_by_color_on_occ(pos, mem, by, occupied);
 }
 
+/*
+ * 著法生成實作
+ * init_gen_info() — 初始化生成上下文（將軍檢測/釘子/攻擊遮罩）
+ * generate_pseudo_captures/quiets() — 生成偽合法捕獲/安靜著法
+ * generate_legal() — 生成完整合法著法列表
+ * legal/legal_fast/pseudo_legal() — 著法合法性驗證
+ * move_gives_check() — 檢測著法是否將軍
+ * attackers_to/checkers_bb/pinned_bb() — 攻擊/將軍/釘子檢測
+ */
 void init_gen_info(
     GenInfo& info,
     const Position& pos,
@@ -1552,7 +1566,7 @@ bool move_gives_check(
         ((bishop_attacks(mem, enemy_king, occupied) & bishop_like) != 0ULL) ||
         ((rook_attacks(mem, enemy_king, occupied) & rook_like) != 0ULL);
 
-#if VALERAIN_VERIFY_GIVES_CHECK
+#if MAGNUS_VERIFY_GIVES_CHECK
     Position next = pos;
     do_move_copy(next, m, mem.tables);
     const bool slow_gives_check =
@@ -1750,4 +1764,4 @@ Move* generate(
     }
 }
 
-} // namespace valerain
+} // namespace magnus

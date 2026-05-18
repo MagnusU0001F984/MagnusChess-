@@ -30,7 +30,12 @@ SOFTWARE.
 #include "MoveGen.h"
 #include "Nnue.h"
 
-namespace valerain::timeman {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus::timeman {
 
 namespace {
 
@@ -50,6 +55,12 @@ constexpr int kMoveOverheadMs = 10;
 
 } // namespace
 
+/*
+ * 時間管理實作
+ * build_limits() — 從 UCI go 參數計算軟/硬時間限制
+ * record_search() — 記錄搜尋結果用於歷史自適應
+ * collect_stats() — 從歷史計算平均時間使用率/分數擺動/著法變更率
+ */
 void TimeManager::new_game() noexcept {
     history_size_ = 0;
     next_index_ = 0;
@@ -271,4 +282,4 @@ TimeManager::HistoryStats TimeManager::collect_stats(Color side) const noexcept 
     return stats;
 }
 
-} // namespace valerain::timeman
+} // namespace magnus::timeman

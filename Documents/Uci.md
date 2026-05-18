@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Uci.cpp` 实现了 ValerainChess 引擎的 **UCI（通用国际象棋接口）** 协议前端。它是引擎与外界的通信桥梁，负责解析 GUI 命令、管理搜索会话、处理选项配置以及格式化输出。
+`Uci.cpp` 实现了 MagnusChess 引擎的 **UCI（通用国际象棋接口）** 协议前端。它是引擎与外界的通信桥梁，负责解析 GUI 命令、管理搜索会话、处理选项配置以及格式化输出。
 
 ### 核心架构
 
@@ -90,7 +90,7 @@
 ## English
 
 ### Overview
-`Uci.cpp` implements the **UCI (Universal Chess Interface)** protocol frontend for the ValerainChess engine. It is the communication bridge between the engine and the outside world, responsible for parsing GUI commands, managing search sessions, handling option configuration, and formatting output.
+`Uci.cpp` implements the **UCI (Universal Chess Interface)** protocol frontend for the MagnusChess engine. It is the communication bridge between the engine and the outside world, responsible for parsing GUI commands, managing search sessions, handling option configuration, and formatting output.
 
 ### Core Architecture
 

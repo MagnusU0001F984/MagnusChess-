@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <cstdint>
@@ -30,7 +36,7 @@ SOFTWARE.
 #include "MoveGen.h"
 #include "Position.h"
 
-namespace valerain::search {
+namespace magnus::search {
 
 enum class MoveStage : std::uint8_t {
     TT_MOVE = 0,
@@ -60,6 +66,13 @@ TT move -> good captures -> killers -> quiets -> bad captures.
 The picker lazily builds each stage on first use so early cutoffs do not pay
 for later generation and scoring work.
 */
+/*
+ * MovePicker — 分階段惰性著法產生器
+ * 階段順序：TT著法 → 好捕獲 → 殺手1 → 殺手2 → 安靜著法 → 壞捕獲
+ * 每階段在首次使用時惰性構建，早期截斷無需支付後續階段的生成/評分成本
+ * QuietControl 控制晚期安靜著法抑制（僅歷史排序，不完整評分）
+ * ScoredEntry 儲存捕獲列表供觀測/工具重用（透過公開存取器）
+ */
 class MovePicker {
 public:
     MovePicker(
@@ -87,7 +100,6 @@ public:
     [[nodiscard]] int quiet_scored() const noexcept { return quiet_scored_; }
     [[nodiscard]] int quiet_suppressed() const noexcept { return quiet_suppressed_; }
 
-private:
     struct ScoredEntry {
         Move move = 0;
         int score = 0;
@@ -95,6 +107,14 @@ private:
         bool quiet_in_skip_band = false;
         bool quiet_suppressed = false;
     };
+
+    // Capture list accessors for observation / tooling reuse.
+    [[nodiscard]] int good_capture_count() const noexcept { return good_size_; }
+    [[nodiscard]] int bad_capture_count() const noexcept { return bad_size_; }
+    [[nodiscard]] const ScoredEntry* good_captures() const noexcept { return good_caps_; }
+    [[nodiscard]] const ScoredEntry* bad_captures() const noexcept { return bad_caps_; }
+
+private:
 
     Position& pos_;
     const memory::Memory& mem_;
@@ -186,4 +206,4 @@ private:
     }
 };
 
-} // namespace valerain::search
+} // namespace magnus::search

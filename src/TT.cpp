@@ -33,7 +33,12 @@ at once, prefer empty lanes when possible, and otherwise replace the weakest
 entry based on depth, age, and bound quality.
 */
 
-namespace valerain::memory {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus::memory {
 
 namespace {
 
@@ -178,6 +183,14 @@ void tt_cluster_store(TTCluster& c, int lane, const TTData& d) noexcept {
     tt_atomic_store(c.tag32[lane], d.tag32, std::memory_order_release);
 }
 
+/*
+ * 置換表實作
+ * tt_cluster_clear() — 清空單個快取行（所有 4 個條目歸零）
+ * tt_resize_mb() — 調整 TT 大小（分配新記憶體、釋放舊的）
+ * tt_new_search() — 遞增世代編號（使舊條目 age 過期）
+ * tt_save() — 儲存條目（選擇最佳替換位置，寫入所有欄位）
+ * tt_probe() — 探測 TT（比較 4 個 tag32，回傳命中條目）
+ */
 void tt_cluster_clear(TTCluster& c) noexcept {
     for (int lane = 0; lane < 4; ++lane) {
         tt_atomic_store(c.tag32[lane], 0U, std::memory_order_relaxed);
@@ -371,4 +384,4 @@ int tt_hashfull(const TT& tt, int max_age) noexcept {
     return (used * 1000) / (n * 4);
 }
 
-} // namespace valerain::memory
+} // namespace magnus::memory

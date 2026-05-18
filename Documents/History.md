@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`History.cpp` 实现了 ValerainChess 搜索引擎中所有历史启发式表格的辅助函数，包括深度分类、SEE 分类、历史奖励/惩罚计算以及 `HistoryTables` 的清理。
+`History.cpp` 实现了 MagnusChess 搜索引擎中所有历史启发式表格的辅助函数，包括深度分类、SEE 分类、历史奖励/惩罚计算以及 `HistoryTables` 的清理。
 
 ### 核心概念
 
@@ -67,7 +67,7 @@ penalty = bonus × 4
 ## English
 
 ### Overview
-`History.cpp` implements auxiliary functions for all history heuristic tables in the ValerainChess search engine, including depth classification, SEE classification, history bonus/penalty computation, and `HistoryTables` cleanup.
+`History.cpp` implements auxiliary functions for all history heuristic tables in the MagnusChess search engine, including depth classification, SEE classification, history bonus/penalty computation, and `HistoryTables` cleanup.
 
 ### Core Concepts
 

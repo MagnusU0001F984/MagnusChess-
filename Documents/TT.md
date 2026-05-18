@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`TT.cpp` 实现了 ValerainChess 引擎的**置换表（Transposition Table, TT）**，这是搜索系统的核心缓存结构。它使用 4 路组相联哈希桶、无锁原子操作和节电替换策略，为搜索提供高效的局面缓存。
+`TT.cpp` 实现了 MagnusChess 引擎的**置换表（Transposition Table, TT）**，这是搜索系统的核心缓存结构。它使用 4 路组相联哈希桶、无锁原子操作和节电替换策略，为搜索提供高效的局面缓存。
 
 ### 核心架构
 
@@ -84,7 +84,7 @@ tt_save(tt, pos.state_key, best_move, best_score, depth, bound, generation);
 ## English
 
 ### Overview
-`TT.cpp` implements the **Transposition Table (TT)** for the ValerainChess engine, the core caching structure of the search system. It uses 4-way set-associative hash buckets, lockless atomic operations, and a conservative replacement policy to provide efficient position caching.
+`TT.cpp` implements the **Transposition Table (TT)** for the MagnusChess engine, the core caching structure of the search system. It uses 4-way set-associative hash buckets, lockless atomic operations, and a conservative replacement policy to provide efficient position caching.
 
 ### Core Architecture
 

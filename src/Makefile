@@ -1,5 +1,5 @@
 CXX := g++
-TARGET := ValerainChess
+TARGET := MagnusChess
 
 BUILD_DIR := build
 OBJ_DIR := $(BUILD_DIR)/obj
@@ -70,6 +70,10 @@ LOWLEVEL_FLAGS := \
 	-fno-exceptions \
 	-fno-rtti
 
+ENCODING_FLAGS := \
+	-finput-charset=UTF-8 \
+	-fexec-charset=UTF-8
+
 WARN_FLAGS := \
 	-Wall \
 	-Wextra \
@@ -86,6 +90,7 @@ BASE_CXXFLAGS := \
 	$(ARCH_FLAGS) \
 	$(OPT_FLAGS) \
 	$(LOWLEVEL_FLAGS) \
+	$(ENCODING_FLAGS) \
 	$(WARN_FLAGS) \
 	$(CPPFLAGS)
 

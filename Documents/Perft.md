@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Perft.cpp` 实现了 ValerainChess 引擎的 **Perft（走法生成验证）** 系统。Perft 通过计算给定深度下所有可能走法序列的总数来验证走法生成器和走法执行/撤销的正确性，同时也作为一种性能基准测试工具。
+`Perft.cpp` 实现了 MagnusChess 引擎的 **Perft（走法生成验证）** 系统。Perft 通过计算给定深度下所有可能走法序列的总数来验证走法生成器和走法执行/撤销的正确性，同时也作为一种性能基准测试工具。
 
 ### 什么是 Perft？
 
@@ -79,7 +79,7 @@ move3: 3456789
 ## English
 
 ### Overview
-`Perft.cpp` implements the **Perft (move generation verification)** system for the ValerainChess engine. Perft validates the correctness of the move generator and move execution/undo by counting all possible move sequences at a given depth, while also serving as a performance benchmarking tool.
+`Perft.cpp` implements the **Perft (move generation verification)** system for the MagnusChess engine. Perft validates the correctness of the move generator and move execution/undo by counting all possible move sequences at a given depth, while also serving as a performance benchmarking tool.
 
 ### What is Perft?
 

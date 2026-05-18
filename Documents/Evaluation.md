@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Evaluation.cpp` 实现了 ValerainChess 引擎的**手写评估函数（Handcrafted Evaluation, HCE）**。虽然引擎也包含 NNUE 评估，HCE 仍被用于增量评估的初始化、NNUE 回退和快速粗略评估场景。
+`Evaluation.cpp` 实现了 MagnusChess 引擎的**手写评估函数（Handcrafted Evaluation, HCE）**。虽然引擎也包含 NNUE 评估，HCE 仍被用于增量评估的初始化、NNUE 回退和快速粗略评估场景。
 
 ### 核心架构
 
@@ -74,7 +74,7 @@ tapered = (mg * phase + eg * (24 - phase)) / 24
 ## English
 
 ### Overview
-`Evaluation.cpp` implements the **Handcrafted Evaluation (HCE)** for the ValerainChess engine. Although the engine also includes NNUE evaluation, HCE is still used for incremental evaluation initialization, NNUE fallback, and fast coarse evaluation scenarios.
+`Evaluation.cpp` implements the **Handcrafted Evaluation (HCE)** for the MagnusChess engine. Although the engine also includes NNUE evaluation, HCE is still used for incremental evaluation initialization, NNUE fallback, and fast coarse evaluation scenarios.
 
 ### Core Architecture
 

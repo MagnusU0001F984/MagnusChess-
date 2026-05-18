@@ -24,19 +24,29 @@ SOFTWARE.
 
 #include "Bench.h"
 #include "Uci.h"
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 #include <string_view>
 
 /*
-Command-line entry point. No arguments starts the engine in UCI mode, while
-explicit subcommands keep the lightweight bench/perft tooling available.
-*/
+ * MagnusChess 命令列入口點 — 程式啟動與模式派發
+ *
+ * 無參數或 "uci" → 啟動 UCI 協定迴圈 (run_uci)
+ * "bench" 或其他 → 啟動基準測試模式 (run_bench)
+ */
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
     if (argc <= 1)
-        return valerain::run_uci();
+        return magnus::run_uci();
 
     if (std::string_view(argv[1]) == "uci")
-        return valerain::run_uci();
+        return magnus::run_uci();
 
-    return valerain::run_bench(argc, argv);
+    return magnus::run_bench(argc, argv);
 }

@@ -25,18 +25,32 @@ SOFTWARE.
 #include "See.h"
 
 #include <algorithm>
-#include <cassert>
 
 #include "Attack.h"
 
-namespace valerain::search {
+/*
+ * SEE (靜態交換評估) 實作 — Static Exchange Evaluation
+ *
+ * 演算法：在不實際走棋的情況下，模擬目標格上的連續兌子交換。
+ * 使用 LVA (Least Valuable Attacker) 順序：兵→馬→象→車→后→王。
+ * 每次交換後更新攻擊者集合（滑子攻擊線可能被打開）。
+ *
+ * 兩個核心函數：
+ *   see_value_fast() — 完整計算捕獲的淨收益（用於著法排序）
+ *   see_ge_fast()    — 判斷捕獲是否達到指定閾值（含提前退出，用於剪枝）
+ *
+ * 棋子價值表（厘兵）：兵=100, 馬=320, 象=330, 車=500, 后=900, 王=20000
+ */
+namespace magnus::search {
 
 namespace {
 
+// SEE 棋子價值表 — 國王設為 20000 確保捕獲國王總是最優先/最昂貴的交換
 constexpr int see_piece_value[PIECE_TYPE_NB] = {
     100, 320, 330, 500, 900, 20000
 };
-constexpr int SEE_MAX_SWAPS = 32;
+// 最大交換步數 — 防止極端情況下的無限循環
+constexpr int SEE_MAX_SWAPS = 64;
 
 [[nodiscard]] inline Bitboard lsb_bit(Bitboard bb) noexcept {
     return bb & (0ULL - bb);
@@ -111,7 +125,8 @@ int see_value_fast(
     const memory::Memory& mem,
     Move move
 ) noexcept {
-    assert(move_is_capture(move));
+    if (!move_is_capture(move))
+        return 0;
 
     const Color us = static_cast<Color>(pos.side_to_move);
     const Square from = from_sq(move);
@@ -179,8 +194,8 @@ int see_value_fast(
             attackers |= rook_attacks(mem, to, occupied) & rook_like;
 
         if (attacker == KING) {
-            const Color them = static_cast<Color>(side ^ 1);
-            if ((attackers & occupied & color_bb[them]) != 0ULL) {
+            const Color opponent = static_cast<Color>(side ^ 1);
+            if ((attackers & occupied & color_bb[opponent]) != 0ULL) {
                 --depth;
                 break;
             }
@@ -215,7 +230,8 @@ bool see_ge_fast(
     Move move,
     int threshold
 ) noexcept {
-    assert(move_is_capture(move));
+    if (!move_is_capture(move))
+        return threshold <= 0;
 
     const Color us = static_cast<Color>(pos.side_to_move);
     const Square from = from_sq(move);
@@ -294,4 +310,4 @@ bool see_ge_fast(
     return side != us;
 }
 
-} // namespace valerain::search
+} // namespace magnus::search

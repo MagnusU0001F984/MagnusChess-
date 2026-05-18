@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Lmr.cpp` 实现了 ValerainChess 引擎的**迟走法裁剪（Late Move Reduction, LMR）** 系统。LMR 是提高搜索效率的核心技术：对排序靠后的走法使用降低的搜索深度，根据走法质量和搜索上下文动态调整减少量。
+`Lmr.cpp` 实现了 MagnusChess 引擎的**迟走法裁剪（Late Move Reduction, LMR）** 系统。LMR 是提高搜索效率的核心技术：对排序靠后的走法使用降低的搜索深度，根据走法质量和搜索上下文动态调整减少量。
 
 ### 核心架构
 
@@ -72,7 +72,7 @@ reduction = base + ln(depth_factor) × ln(move_index_offset)
 ## English
 
 ### Overview
-`Lmr.cpp` implements the **Late Move Reduction (LMR)** system for the ValerainChess engine. LMR is a core technique for improving search efficiency: later-sorted moves are searched with reduced depth, with the reduction amount dynamically adjusted based on move quality and search context.
+`Lmr.cpp` implements the **Late Move Reduction (LMR)** system for the MagnusChess engine. LMR is a core technique for improving search efficiency: later-sorted moves are searched with reduced depth, with the reduction amount dynamically adjusted based on move quality and search context.
 
 ### Core Architecture
 

@@ -26,6 +26,7 @@ SOFTWARE.
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -33,7 +34,36 @@ SOFTWARE.
 #include <immintrin.h>
 #include <string>
 
-namespace valerain::nnue {
+/*
+ * NNUE 評估器實作 — Efficiently Updatable Neural Network
+ *
+ * 架構：Chess768 雙視角 → 128 隱藏層神經元 → 1 輸出
+ *
+ * 核心組件：
+ *   1. 增量累加器更新
+ *      - on_piece_added/removed/moved 鉤子
+ *      - 每次 make/unmake 僅更新 O(隱藏層) 而非 O(輸入×隱藏層)
+ *      - AVX2 SIMD 加速（每次處理 16 個神經元）
+ *
+ *   2. 前向傳播 (forward pass)
+ *      - Clipped ReLU: clamp(x, 0, 255)
+ *      - 平方激活: screlu(x) = clamp(x, 0, 255)^2
+ *      - AVX2 點積 (forward_dot_avx2)
+ *      - 標量後備路徑（無 AVX2 時）
+ *
+ *   3. 分數轉換
+ *      - CP 查表 (build_cp_lookup_table): 基於材料的多項式模型
+ *      - 勝率模型 (win_rate_model): Sigmoid 函數
+ *      - WDL 三元組 (uci_wdl_from_cp): 勝/和/負千分比
+ *
+ *   4. 檔案載入
+ *      - 原生 .nnue 格式（含標頭 magic + version + dimensions + scale）
+ *      - Bullet quantised .bin 格式（Rust simple.rs 輸出，無標頭）
+ *
+ * 網路狀態儲存在 NativeNetwork (g_net) 中，為全域單例。
+ * 累加器儲存在 Position 結構體中（每個視角一個）。
+ */
+namespace magnus::nnue {
 
 namespace {
 
@@ -75,6 +105,7 @@ struct NativeNetwork {
 
 NativeNetwork g_net{};
 u32 g_generation = 1;
+std::atomic<bool> g_loading{false};
 
 constexpr int kWinRateMaterialMin = 17;
 constexpr int kWinRateMaterialMax = 78;
@@ -97,22 +128,29 @@ using CpLookupTable = std::array<CpLookupRow, kMaterialBucketCount>;
 
 [[nodiscard]] CpLookupTable build_cp_lookup_table() {
     CpLookupTable lut{};
-    for (int material = kWinRateMaterialMin; material <= kWinRateMaterialMax; ++material) {
+    for (int mat_idx = 0; mat_idx < kMaterialBucketCount; ++mat_idx) {
+        const int material = kWinRateMaterialMin + mat_idx;
         const double m = static_cast<double>(material) / 58.0;
         const double a =
             (((kWinRateAs[0] * m + kWinRateAs[1]) * m + kWinRateAs[2]) * m)
             + kWinRateAs[3];
-        auto& row = lut[static_cast<std::size_t>(material - kWinRateMaterialMin)];
+        // Precompute reciprocal scale to move the division out of the inner loop.
+        const float scale = 100.0f / static_cast<float>(a);
+        auto& row = lut[static_cast<std::size_t>(mat_idx)];
         for (int raw = 0; raw <= kCpLookupMaxRaw; ++raw) {
-            row[static_cast<std::size_t>(raw)] = static_cast<i16>(std::llround(
-                (100.0 * static_cast<double>(raw)) / a
-            ));
+            row[static_cast<std::size_t>(raw)] = static_cast<i16>(
+                static_cast<float>(raw) * scale + 0.5f
+            );
         }
     }
     return lut;
 }
 
-const CpLookupTable g_cp_lookup = build_cp_lookup_table();
+// Meyer's Singleton avoids the Static Initialization Order Fiasco.
+[[nodiscard]] const CpLookupTable& cp_lookup_table() noexcept {
+    static const CpLookupTable table = build_cp_lookup_table();
+    return table;
+}
 
 template<typename T>
 [[nodiscard]] T read_le(std::istream& in) {
@@ -196,7 +234,7 @@ template<typename T>
 
 [[nodiscard]] inline int win_rate_material(const Position& pos) noexcept {
     return std::clamp(
-        valerain::non_king_material(pos),
+        magnus::non_king_material(pos),
         kWinRateMaterialMin,
         kWinRateMaterialMax
     );
@@ -204,7 +242,7 @@ template<typename T>
 
 [[nodiscard]] inline int lookup_cp(int raw, int material) noexcept {
     const auto& row =
-        g_cp_lookup[static_cast<std::size_t>(material - kWinRateMaterialMin)];
+        cp_lookup_table()[static_cast<std::size_t>(material - kWinRateMaterialMin)];
     const i64 abs_raw = raw >= 0 ? static_cast<i64>(raw) : -static_cast<i64>(raw);
     const int index = static_cast<int>(std::min<i64>(abs_raw, kCpLookupMaxRaw));
     const int cp = static_cast<int>(row[static_cast<std::size_t>(index)]);
@@ -466,10 +504,8 @@ void clear_network() noexcept {
     }
 
     i32 sum = horizontal_sum_epi32_avx2(_mm256_add_epi32(sum_us, sum_them));
-    for (; i < kHidden; ++i) {
-        sum += static_cast<i32>(w_us_ptr[i]) * screlu(static_cast<i32>(us_ptr[i]));
-        sum += static_cast<i32>(w_them_ptr[i]) * screlu(static_cast<i32>(them_ptr[i]));
-    }
+    // kHidden (=128) is an exact multiple of 16, so the AVX2 loop covers every element.
+    static_assert(kHidden % 16 == 0, "kHidden must be a multiple of 16 for the AVX2 path");
 
     return sum;
 }
@@ -539,15 +575,19 @@ bool load_bullet_simple_quantised(const std::string& path) {
 } // namespace
 
 bool load(const std::string& path) {
+    g_loading.store(true, std::memory_order_release);
     unload();
 
     if (path.size() >= 4 && path.substr(path.size() - 4) == ".bin") {
-        return load_bullet_simple_quantised(path);
+        bool ok = load_bullet_simple_quantised(path);
+        g_loading.store(false, std::memory_order_release);
+        return ok;
     }
 
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         g_net.error = "cannot open NNUE file: " + path;
+        g_loading.store(false, std::memory_order_release);
         return false;
     }
 
@@ -561,21 +601,25 @@ bool load(const std::string& path) {
 
     if (!in) {
         g_net.error = "failed to read NNUE header";
+        g_loading.store(false, std::memory_order_release);
         return false;
     }
 
     if (h.magic != kMagic) {
         g_net.error = "bad NNUE magic";
+        g_loading.store(false, std::memory_order_release);
         return false;
     }
 
     if (h.version != kVersion) {
         g_net.error = "unsupported NNUE version";
+        g_loading.store(false, std::memory_order_release);
         return false;
     }
 
     if (h.input_size != kInputs || h.hidden_size != kHidden) {
         g_net.error = "network dimensions mismatch";
+        g_loading.store(false, std::memory_order_release);
         return false;
     }
 
@@ -589,13 +633,15 @@ bool load(const std::string& path) {
     if (!in) {
         clear_network();
         g_net.error = "truncated NNUE file";
+        g_loading.store(false, std::memory_order_release);
         return false;
     }
 
     g_net.is_loaded = true;
     g_net.is_bullet_simple = false;
     g_net.loaded_path = path;
-    g_net.desc = "Valerain native NNUE v1 (Chess768 dual-perspective 128x1)";
+    g_net.desc = "Magnus native NNUE v1 (Chess768 dual-perspective 128x1)";
+    g_loading.store(false, std::memory_order_release);
     return true;
 }
 
@@ -620,7 +666,7 @@ const std::string& last_error() noexcept {
 }
 
 int eval(const Position& pos) noexcept {
-    if (!g_net.is_loaded)
+    if (!g_net.is_loaded || g_loading.load(std::memory_order_acquire))
         return 0;
     return forward(pos);
 }
@@ -710,4 +756,4 @@ int search_score_to_cp(int score, const Position& pos) noexcept {
     return to_cp(score, pos);
 }
 
-} // namespace valerain::nnue
+} // namespace magnus::nnue

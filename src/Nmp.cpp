@@ -26,14 +26,29 @@ SOFTWARE.
 
 #include <algorithm>
 
-namespace valerain::search {
+/*
+ * NMP (空步剪枝) 實作 — Null Move Pruning
+ *
+ * 核心思想：給對方一個「免費回合」。
+ * 若對方多走一步仍無法將局面降到 beta 以下，則當前節點很可能截斷，
+ * 可以直接回傳 beta 而無需搜索所有著法。
+ *
+ * 注意事項：
+ *   1. 被將軍時不可空步（否則跳過應將）
+ *   2. Zugzwang 局面需特別處理（僅有王+兵時禁用空步）
+ *   3. 深層空步需要驗證搜索以免誤剪
+ *
+ * NMP 減免量 = 2 + depth/4 + eval_margin/96 + cut_node + !improving + !tt_move
+ */
+namespace magnus::search {
 
 namespace {
 
-constexpr int NMP_STATIC_BASE = 160;
-constexpr int NMP_STATIC_DEPTH_SLOPE = 8;
-constexpr int NMP_IMPROVING_MARGIN = 64;
-constexpr int NMP_EVAL_BUCKET = 96;
+// NMP 常數 — SPSA 調參結果
+constexpr int NMP_STATIC_BASE = 160;        // 基礎評估門檻
+constexpr int NMP_STATIC_DEPTH_SLOPE = 8;   // 每層深度的門檻斜率
+constexpr int NMP_IMPROVING_MARGIN = 64;    // 改善局面時放寬門檻
+constexpr int NMP_EVAL_BUCKET = 96;         // 評估餘量分桶大小（每 96cp 增加 1 層減免）
 constexpr int NMP_MIN_REDUCTION = 2;
 constexpr int NMP_VERIFICATION_MIN_DEPTH = 16;
 constexpr int NMP_VERIFICATION_MIN_SPAN = 2;
@@ -104,4 +119,4 @@ NmpDecision decide_null_move(const NmpNodeContext& node) noexcept {
     return decision;
 }
 
-} // namespace valerain::search
+} // namespace magnus::search

@@ -28,11 +28,31 @@ SOFTWARE.
 #include <array>
 #include <cmath>
 
-namespace valerain::search {
+#include "TT.h"
+
+/*
+ * LMR (延遲著法減免) 實作 — Late Move Reduction
+ *
+ * 這是搜尋引擎最關鍵的剪枝技術。核心原理：
+ *   排序靠後的著法用縮減深度搜索，節省大量節點。
+ *   若縮減搜索意外超過 alpha，觸發 re-search 確認。
+ *
+ * 減免量使用固定點 (fixed-point) 算術，FP_ONE_PLY=1024 代表 1 個 ply。
+ * 基礎減免 = log(depth) * log(move_index)，通過查表實現，
+ * 然後根據節點類型、改善狀態、TT 狀態、歷史分數等進行 ± 調整。
+ *
+ * 兩個公開函數：
+ *   decide_lmr()        — 計算減免決策（是否減免、減免量）
+ *   lmr_research_depth() — 計算 re-search 深度（減免搜索超過 alpha 時）
+ */
+namespace magnus::search {
 
 namespace {
 
+// FP_ONE_PLY = 1024：固定點精度，1 個 ply = 1024 單位
+// 使用固定點而非浮點避免精度問題並加速計算
 constexpr int FP_ONE_PLY = 1024;
+// LMR 查表最大索引 — 對數表的預計算範圍
 constexpr int LMR_TABLE_MAX_INDEX = 64;
 constexpr double LMR_TABLE_LOG_SCALE = 2747.0 / 128.0;
 constexpr int QUIET_HISTORY_FP_DIVISOR = 12;
@@ -66,10 +86,16 @@ constexpr int LMR_SHALLOWER_RESEARCH_MARGIN = 8;
     return std::max(0, (d * m * 3) / 4 - FP_ONE_PLY / 4);
 }
 
-[[nodiscard]] static inline int quiet_stat_score(const LmrMoveContext& move) noexcept {
+// Depth-adaptive continuation weighting: shallow continuation signals
+// are noisier, so scale them down relative to the search depth.
+[[nodiscard]] static inline int quiet_stat_score(
+    const LmrMoveContext& move, int depth
+) noexcept {
+    const int depth_factor = std::min(320, 128 + depth * 16); // depth=4→192, depth=12→320
+    const int weighted_continuation = move.continuation_score * depth_factor / 256;
     return std::clamp(
         2 * move.quiet_history_score
-            + move.continuation_score
+            + weighted_continuation
             + move.countermove_bonus / 2
             + move.ordering_score / 8,
         -16384,
@@ -134,13 +160,21 @@ LmrDecision decide_lmr(const LmrNodeContext& node, const LmrMoveContext& move) n
         return decision;
 
     decision.stat_score = move.quiet
-        ? quiet_stat_score(move)
+        ? quiet_stat_score(move, node.depth)
         : capture_stat_score(move);
 
     int fp = 0;
     fp = quiet_candidate
         ? base_quiet_reduction_fp(node.depth, move.move_index)
         : base_capture_reduction_fp(node.depth, move.reduction_index);
+
+    // SEE-guided capture reduction: winning captures should barely be reduced.
+    if (capture_candidate) {
+        if (move.see_value >= 200)           fp -= FP_ONE_PLY / 2;
+        else if (move.see_value >= 100)      fp -= FP_ONE_PLY / 4;
+        else if (move.see_value < -50)       fp += FP_ONE_PLY / 4;
+        fp = std::max(0, fp);
+    }
 
     decision.base_reduction_fp = fp;
 
@@ -159,6 +193,16 @@ LmrDecision decide_lmr(const LmrNodeContext& node, const LmrMoveContext& move) n
 
     if (node.tt_move_is_capture && move.quiet)
         fp += FP_ONE_PLY / 8;
+
+    // TT quality confidence: deeper/exact TT entries → less reduction.
+    if (node.tt_move_present && node.tt_depth > 0) {
+        if (node.tt_depth >= node.depth)
+            fp -= FP_ONE_PLY / 4;
+        if (node.tt_bound == static_cast<int>(memory::BOUND_EXACT))
+            fp -= FP_ONE_PLY / 4;
+        else if (node.tt_bound == static_cast<int>(memory::BOUND_LOWER))
+            fp -= FP_ONE_PLY / 8;
+    }
 
     if (move.is_tt_move)
         fp -= FP_ONE_PLY;
@@ -181,6 +225,7 @@ LmrDecision decide_lmr(const LmrNodeContext& node, const LmrMoveContext& move) n
     const int max_reduction = move.quiet
         ? std::min(node.depth - 1, 5)
         : std::min(node.depth - 1, 3);
+
     decision.final_reduction_fp = std::clamp(
         fp,
         min_reduction * FP_ONE_PLY,
@@ -214,4 +259,4 @@ int lmr_research_depth(
     return std::clamp(research_depth, 1, full_depth + 1);
 }
 
-} // namespace valerain::search
+} // namespace magnus::search

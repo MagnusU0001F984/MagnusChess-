@@ -24,6 +24,7 @@ SOFTWARE.
 
 #include "Attack.h"
 #include "Bench.h"
+#include "Common.h"
 #include "Memory.h"
 #include "MoveGen.h"
 #include "Nnue.h"
@@ -34,8 +35,7 @@ SOFTWARE.
 #include <array>
 #include <charconv>
 #include <chrono>
-#include <cctype>
-#include <cstdlib>
+
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
@@ -44,7 +44,12 @@ SOFTWARE.
 #include <string_view>
 #include <streambuf>
 
-namespace valerain {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus {
 
 namespace {
 
@@ -74,26 +79,6 @@ struct SearchBenchResult {
     std::string ponder{};
 };
 
-[[nodiscard]] std::string default_eval_file() {
-    constexpr const char* candidates[] = {
-        "Evalfile.bin",
-        "bin/Evalfile.bin",
-        "src/bin/Evalfile.bin",
-        "src/Evalfile.bin",
-        "src/bin/quantised.bin",
-        "NnueFile/nn-2a5d6101d177.nnue",
-        "src/NnueFile/nn-2a5d6101d177.nnue",
-        "NnueFile/nn-37f18f62d772.nnue",
-        "src/NnueFile/nn-37f18f62d772.nnue"
-    };
-
-    for (const char* candidate : candidates)
-        if (std::filesystem::exists(candidate))
-            return candidate;
-
-    return "Evalfile.bin";
-}
-
 [[nodiscard]] bool ensure_nnue_loaded(
     const std::string& eval_file,
     std::ostream* out
@@ -110,272 +95,6 @@ struct SearchBenchResult {
     if (out)
         *out << "info string failed to load nnue: " << nnue::last_error() << '\n';
     return false;
-}
-
-[[nodiscard]] bool parse_int(std::string_view sv, int& value) noexcept {
-    const char* first = sv.data();
-    const char* last = sv.data() + sv.size();
-    const auto [ptr, ec] = std::from_chars(first, last, value);
-    return ec == std::errc{} && ptr == last;
-}
-
-[[nodiscard]] bool parse_square(std::string_view sv, Square& sq) noexcept {
-    if (sv.size() != 2)
-        return false;
-
-    const char file = sv[0];
-    const char rank = sv[1];
-    if (file < 'a' || file > 'h' || rank < '1' || rank > '8')
-        return false;
-
-    sq = static_cast<Square>((rank - '1') * 8 + (file - 'a'));
-    return true;
-}
-
-class PvTrackingStreamBuf final : public std::streambuf {
-public:
-    explicit PvTrackingStreamBuf(std::streambuf* sink) noexcept
-        : sink_(sink) {}
-
-    ~PvTrackingStreamBuf() override {
-        flush_pending_line();
-    }
-
-    [[nodiscard]] std::string_view last_pv() const noexcept {
-        return last_pv_;
-    }
-
-protected:
-    int overflow(int ch) override {
-        if (ch == traits_type::eof())
-            return sync() == 0 ? traits_type::not_eof(ch) : traits_type::eof();
-
-        const char c = static_cast<char>(ch);
-        append_char(c);
-        if (sink_ == nullptr)
-            return ch;
-
-        const int result = sink_->sputc(c);
-        if (c == '\n')
-            sink_->pubsync();
-        return result;
-    }
-
-    std::streamsize xsputn(
-        const char* s,
-        std::streamsize count
-    ) override {
-        bool saw_newline = false;
-        for (std::streamsize i = 0; i < count; ++i) {
-            append_char(s[i]);
-            saw_newline = saw_newline || s[i] == '\n';
-        }
-
-        if (sink_ == nullptr)
-            return count;
-
-        const std::streamsize written = sink_->sputn(s, count);
-        if (saw_newline)
-            sink_->pubsync();
-        return written;
-    }
-
-    int sync() override {
-        flush_pending_line();
-        return sink_ != nullptr ? sink_->pubsync() : 0;
-    }
-
-private:
-    void append_char(char c) {
-        if (c == '\n') {
-            flush_pending_line();
-            return;
-        }
-
-        if (c != '\r')
-            line_buffer_.push_back(c);
-    }
-
-    void flush_pending_line() {
-        if (line_buffer_.empty())
-            return;
-
-        process_line();
-        line_buffer_.clear();
-    }
-
-    void process_line() {
-        const std::string_view line{line_buffer_};
-        if (line.rfind("info ", 0) != 0)
-            return;
-
-        constexpr std::string_view pv_marker = " pv ";
-        const std::size_t pv_pos = line.find(pv_marker);
-        if (pv_pos == std::string_view::npos)
-            return;
-
-        const std::size_t pv_begin = pv_pos + pv_marker.size();
-        if (pv_begin >= line.size())
-            return;
-
-        last_pv_.assign(line.substr(pv_begin));
-    }
-
-    std::streambuf* sink_ = nullptr;
-    std::string line_buffer_{};
-    std::string last_pv_{};
-};
-
-[[nodiscard]] bool find_uci_move(
-    const Position& pos,
-    const memory::Memory& mem,
-    std::string_view token,
-    Move& move
-) noexcept {
-    MoveList list{};
-    generate_legal(pos, mem, list);
-
-    for (int i = 0; i < list.size; ++i) {
-        if (search::move_to_uci(list.moves[i]) == token) {
-            move = list.moves[i];
-            return true;
-        }
-    }
-
-    return false;
-}
-
-[[nodiscard]] std::string ponder_move_from_last_pv(
-    const Position& root,
-    const memory::Memory& mem,
-    Move best_move,
-    std::string_view last_pv
-) noexcept {
-    if (move_is_none(best_move) || last_pv.empty())
-        return {};
-
-    std::istringstream pv_stream{std::string(last_pv)};
-    std::string best_token;
-    std::string ponder_token;
-    if (!(pv_stream >> best_token >> ponder_token))
-        return {};
-
-    Move pv_best_move = 0;
-    if (!find_uci_move(root, mem, best_token, pv_best_move) ||
-        pv_best_move != best_move) {
-        return {};
-    }
-
-    Position after_best = root;
-    do_move_copy(after_best, best_move, mem.tables);
-
-    Move ponder_move = 0;
-    if (!find_uci_move(after_best, mem, ponder_token, ponder_move))
-        return {};
-
-    return search::move_to_uci(ponder_move);
-}
-
-[[nodiscard]] bool parse_piece_char(
-    char c,
-    Color& color,
-    PieceType& piece_type
-) noexcept {
-    color = std::isupper(static_cast<unsigned char>(c)) ? WHITE : BLACK;
-
-    switch (static_cast<char>(std::tolower(static_cast<unsigned char>(c)))) {
-        case 'p': piece_type = PAWN; return true;
-        case 'n': piece_type = KNIGHT; return true;
-        case 'b': piece_type = BISHOP; return true;
-        case 'r': piece_type = ROOK; return true;
-        case 'q': piece_type = QUEEN; return true;
-        case 'k': piece_type = KING; return true;
-        default: return false;
-    }
-}
-
-[[nodiscard]] bool parse_fen(
-    Position& pos,
-    const memory::Memory& mem,
-    std::string_view fen
-) noexcept {
-    std::istringstream iss{std::string(fen)};
-
-    std::string board_part;
-    std::string stm_part;
-    std::string castling_part;
-    std::string ep_part;
-    std::string halfmove_part = "0";
-    std::string fullmove_part = "1";
-
-    if (!(iss >> board_part >> stm_part >> castling_part >> ep_part))
-        return false;
-
-    iss >> halfmove_part >> fullmove_part;
-
-    position_clear(pos);
-
-    int rank = 7;
-    int file = 0;
-
-    for (char c : board_part) {
-        if (c == '/') {
-            if (file != 8 || rank == 0)
-                return false;
-
-            --rank;
-            file = 0;
-            continue;
-        }
-
-        if (c >= '1' && c <= '8') {
-            file += c - '0';
-            if (file > 8)
-                return false;
-            continue;
-        }
-
-        Color color = WHITE;
-        PieceType piece_type = PAWN;
-        if (!parse_piece_char(c, color, piece_type) || file >= 8)
-            return false;
-
-        position_put_piece(pos, color, piece_type, rank * 8 + file);
-        ++file;
-    }
-
-    if (rank != 0 || file != 8)
-        return false;
-
-    if (stm_part == "w") pos.side_to_move = WHITE;
-    else if (stm_part == "b") pos.side_to_move = BLACK;
-    else return false;
-
-    pos.castling_rights = NO_CASTLING;
-    if (castling_part != "-") {
-        for (char c : castling_part) {
-            switch (c) {
-                case 'K': pos.castling_rights |= WHITE_OO; break;
-                case 'Q': pos.castling_rights |= WHITE_OOO; break;
-                case 'k': pos.castling_rights |= BLACK_OO; break;
-                case 'q': pos.castling_rights |= BLACK_OOO; break;
-                default: return false;
-            }
-        }
-    }
-
-    pos.ep_sq = NO_SQ;
-    if (ep_part != "-" && !parse_square(ep_part, pos.ep_sq))
-        return false;
-
-    if (!parse_int(halfmove_part, pos.halfmove_clock) || pos.halfmove_clock < 0)
-        return false;
-
-    if (!parse_int(fullmove_part, pos.fullmove_number) || pos.fullmove_number <= 0)
-        return false;
-
-    position_refresh_key(pos, mem.tables);
-    return position_has_valid_kings(pos) && position_board_matches_bitboards(pos);
 }
 
 [[nodiscard]] SearchBenchResult benchmark_search_position(
@@ -612,6 +331,13 @@ bool run_timed_search_bench(
     return true;
 }
 
+/*
+ * 基準測試實作
+ * parse_config() — 解析命令列參數（perft/search/timed_search 模式）
+ * benchmark_perft() — Perft 節點計數基準測試
+ * run_search_bench() — 固定深度搜尋基準測試
+ * run_timed_search_bench() — 定時搜尋基準測試（模擬真實對局）
+ */
 BenchConfig parse_config(int argc, char** argv) noexcept {
     BenchConfig cfg;
     int argi = 1;
@@ -630,20 +356,36 @@ BenchConfig parse_config(int argc, char** argv) noexcept {
         argi = 2;
     }
 
+    auto parse_arg_int = [&](int idx, int default_val) noexcept {
+        if (idx >= argc || !argv[idx] || !argv[idx][0])
+            return default_val;
+        int value = 0;
+        std::string_view sv(argv[idx]);
+        if (std::from_chars(sv.data(), sv.data() + sv.size(), value).ec == std::errc{})
+            return value;
+        return default_val;
+    };
+    auto parse_arg_u64 = [&](int idx, std::size_t default_val) noexcept -> std::size_t {
+        if (idx >= argc || !argv[idx] || !argv[idx][0])
+            return default_val;
+        u64 value = 0;
+        std::string_view sv(argv[idx]);
+        if (std::from_chars(sv.data(), sv.data() + sv.size(), value).ec == std::errc{})
+            return static_cast<std::size_t>(value);
+        return default_val;
+    };
+
     if (cfg.search) {
-        if (cfg.timed_search) {
-            if (argc > argi)
-                cfg.search_movetime_ms = std::max(1, std::atoi(argv[argi]));
-        } else {
-            if (argc > argi)
-                cfg.search_depth = std::max(1, std::atoi(argv[argi]));
-        }
-        if (argc > argi + 1) cfg.hash_mb = static_cast<std::size_t>(std::strtoull(argv[argi + 1], nullptr, 10));
-        if (argc > argi + 2) cfg.threads = static_cast<std::size_t>(std::strtoull(argv[argi + 2], nullptr, 10));
+        if (cfg.timed_search)
+            cfg.search_movetime_ms = std::max(1, parse_arg_int(argi, cfg.search_movetime_ms));
+        else
+            cfg.search_depth = std::max(1, parse_arg_int(argi, cfg.search_depth));
+        cfg.hash_mb = parse_arg_u64(argi + 1, cfg.hash_mb);
+        cfg.threads = parse_arg_u64(argi + 2, cfg.threads);
     } else {
-        if (argc > argi) cfg.perft_depth = std::max(0, std::atoi(argv[argi]));
-        if (argc > argi + 1) cfg.hash_mb = static_cast<std::size_t>(std::strtoull(argv[argi + 1], nullptr, 10));
-        if (argc > argi + 2) cfg.threads = static_cast<std::size_t>(std::strtoull(argv[argi + 2], nullptr, 10));
+        cfg.perft_depth = std::max(0, parse_arg_int(argi, cfg.perft_depth));
+        cfg.hash_mb = parse_arg_u64(argi + 1, cfg.hash_mb);
+        cfg.threads = parse_arg_u64(argi + 2, cfg.threads);
         if (argc > argi + 3 && std::string_view(argv[argi + 3]) == "live")
             cfg.live_divide = true;
     }
@@ -721,4 +463,4 @@ int run_bench(int argc, char** argv) {
     return 0;
 }
 
-} // namespace valerain
+} // namespace magnus

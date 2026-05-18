@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`Time.cpp` 实现了 ValerainChess 引擎的**时间管理**系统。它解析 UCI `go` 命令的时间参数，使用 Stockfish 风格的动态时间分配公式，为每次搜索计算最优的软/硬时间限制。
+`Time.cpp` 实现了 MagnusChess 引擎的**时间管理**系统。它解析 UCI `go` 命令的时间参数，使用 Stockfish 风格的动态时间分配公式，为每次搜索计算最优的软/硬时间限制。
 
 ### 核心架构
 
@@ -87,7 +87,7 @@ max_time = min(opt_time × max_factor, 剩留时间)
 ## English
 
 ### Overview
-`Time.cpp` implements the **time management** system for the ValerainChess engine. It parses time parameters from UCI `go` commands, uses a Stockfish-style dynamic time allocation formula, and computes optimal soft/hard time limits for each search.
+`Time.cpp` implements the **time management** system for the MagnusChess engine. It parses time parameters from UCI `go` commands, uses a Stockfish-style dynamic time allocation formula, and computes optimal soft/hard time limits for each search.
 
 ### Core Architecture
 

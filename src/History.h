@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <algorithm>
@@ -33,86 +39,86 @@ SOFTWARE.
 #include "Search.h"
 #include "Types.h"
 
-namespace valerain::search {
+namespace magnus::search {
 
-#ifndef VALERAIN_SEE_BIAS_BONUS_DIV
-#define VALERAIN_SEE_BIAS_BONUS_DIV 10
+#ifndef MAGNUS_SEE_BIAS_BONUS_DIV
+#define MAGNUS_SEE_BIAS_BONUS_DIV 10
 #endif
 
-#if VALERAIN_SEE_BIAS_BONUS_DIV <= 0
-#error "VALERAIN_SEE_BIAS_BONUS_DIV must be positive"
+#if MAGNUS_SEE_BIAS_BONUS_DIV <= 0
+#error "MAGNUS_SEE_BIAS_BONUS_DIV must be positive"
 #endif
 
-#ifndef VALERAIN_SEE_BIAS_MED_LOW_BONUS_DIV
-#define VALERAIN_SEE_BIAS_MED_LOW_BONUS_DIV 24
+#ifndef MAGNUS_SEE_BIAS_MED_LOW_BONUS_DIV
+#define MAGNUS_SEE_BIAS_MED_LOW_BONUS_DIV 24
 #endif
 
-#if VALERAIN_SEE_BIAS_MED_LOW_BONUS_DIV <= 0
-#error "VALERAIN_SEE_BIAS_MED_LOW_BONUS_DIV must be positive"
+#if MAGNUS_SEE_BIAS_MED_LOW_BONUS_DIV <= 0
+#error "MAGNUS_SEE_BIAS_MED_LOW_BONUS_DIV must be positive"
 #endif
 
-#ifndef VALERAIN_SEE_BIAS_FAIL_SCALE
-#define VALERAIN_SEE_BIAS_FAIL_SCALE 4
+#ifndef MAGNUS_SEE_BIAS_FAIL_SCALE
+#define MAGNUS_SEE_BIAS_FAIL_SCALE 4
 #endif
 
-#if VALERAIN_SEE_BIAS_FAIL_SCALE <= 0
-#error "VALERAIN_SEE_BIAS_FAIL_SCALE must be positive"
+#if MAGNUS_SEE_BIAS_FAIL_SCALE <= 0
+#error "MAGNUS_SEE_BIAS_FAIL_SCALE must be positive"
 #endif
 
-#ifndef VALERAIN_SEE_BIAS_BAD_THRESHOLD
-#define VALERAIN_SEE_BIAS_BAD_THRESHOLD -50
+#ifndef MAGNUS_SEE_BIAS_BAD_THRESHOLD
+#define MAGNUS_SEE_BIAS_BAD_THRESHOLD -50
 #endif
 
-#ifndef VALERAIN_SEE_BIAS_EQ_THRESHOLD
-#define VALERAIN_SEE_BIAS_EQ_THRESHOLD 50
+#ifndef MAGNUS_SEE_BIAS_EQ_THRESHOLD
+#define MAGNUS_SEE_BIAS_EQ_THRESHOLD 50
 #endif
 
-#ifndef VALERAIN_SEE_BIAS_GOOD_BIG_THRESHOLD
-#define VALERAIN_SEE_BIAS_GOOD_BIG_THRESHOLD 200
+#ifndef MAGNUS_SEE_BIAS_GOOD_BIG_THRESHOLD
+#define MAGNUS_SEE_BIAS_GOOD_BIG_THRESHOLD 200
 #endif
 
-#ifndef VALERAIN_COUNTERMOVE_BONUS
-#define VALERAIN_COUNTERMOVE_BONUS 4096
+#ifndef MAGNUS_COUNTERMOVE_BONUS
+#define MAGNUS_COUNTERMOVE_BONUS 4096
 #endif
 
-#ifndef VALERAIN_QUIET_HISTORY_WEIGHT
-#define VALERAIN_QUIET_HISTORY_WEIGHT 1
+#ifndef MAGNUS_QUIET_HISTORY_WEIGHT
+#define MAGNUS_QUIET_HISTORY_WEIGHT 1
 #endif
 
-#ifndef VALERAIN_COUNTERMOVE_WEIGHT_NUM
-#define VALERAIN_COUNTERMOVE_WEIGHT_NUM 1
+#ifndef MAGNUS_COUNTERMOVE_WEIGHT_NUM
+#define MAGNUS_COUNTERMOVE_WEIGHT_NUM 1
 #endif
 
-#ifndef VALERAIN_COUNTERMOVE_WEIGHT_DEN
-#define VALERAIN_COUNTERMOVE_WEIGHT_DEN 1
+#ifndef MAGNUS_COUNTERMOVE_WEIGHT_DEN
+#define MAGNUS_COUNTERMOVE_WEIGHT_DEN 1
 #endif
 
-#ifndef VALERAIN_CONT1_WEIGHT_NUM
-#define VALERAIN_CONT1_WEIGHT_NUM 1
+#ifndef MAGNUS_CONT1_WEIGHT_NUM
+#define MAGNUS_CONT1_WEIGHT_NUM 1
 #endif
 
-#ifndef VALERAIN_CONT1_WEIGHT_DEN
-#define VALERAIN_CONT1_WEIGHT_DEN 1
+#ifndef MAGNUS_CONT1_WEIGHT_DEN
+#define MAGNUS_CONT1_WEIGHT_DEN 1
 #endif
 
-#ifndef VALERAIN_CONT2_WEIGHT_NUM
-#define VALERAIN_CONT2_WEIGHT_NUM 1
+#ifndef MAGNUS_CONT2_WEIGHT_NUM
+#define MAGNUS_CONT2_WEIGHT_NUM 1
 #endif
 
-#ifndef VALERAIN_CONT2_WEIGHT_DEN
-#define VALERAIN_CONT2_WEIGHT_DEN 4
+#ifndef MAGNUS_CONT2_WEIGHT_DEN
+#define MAGNUS_CONT2_WEIGHT_DEN 4
 #endif
 
-#ifndef VALERAIN_CAPTURE_HISTORY_WEIGHT
-#define VALERAIN_CAPTURE_HISTORY_WEIGHT 1
+#ifndef MAGNUS_CAPTURE_HISTORY_WEIGHT
+#define MAGNUS_CAPTURE_HISTORY_WEIGHT 1
 #endif
 
-#ifndef VALERAIN_CAPTURE_IMM_SEE_WEIGHT
-#define VALERAIN_CAPTURE_IMM_SEE_WEIGHT 1
+#ifndef MAGNUS_CAPTURE_IMM_SEE_WEIGHT
+#define MAGNUS_CAPTURE_IMM_SEE_WEIGHT 1
 #endif
 
-#ifndef VALERAIN_CAPTURE_SEE_BIAS_WEIGHT
-#define VALERAIN_CAPTURE_SEE_BIAS_WEIGHT 1
+#ifndef MAGNUS_CAPTURE_SEE_BIAS_WEIGHT
+#define MAGNUS_CAPTURE_SEE_BIAS_WEIGHT 1
 #endif
 
 enum class SeeClass : std::uint8_t {
@@ -140,18 +146,18 @@ enum class SeeScalePreset : std::uint8_t {
     Strong
 };
 
-#ifndef VALERAIN_SEE_TERM_PRESET
-#define VALERAIN_SEE_TERM_PRESET 1
+#ifndef MAGNUS_SEE_TERM_PRESET
+#define MAGNUS_SEE_TERM_PRESET 1
 #endif
 
-#if VALERAIN_SEE_TERM_PRESET == 0
+#if MAGNUS_SEE_TERM_PRESET == 0
 constexpr SeeScalePreset HISTORY_ORDERING_SEE_TERM_PRESET = SeeScalePreset::Weak;
-#elif VALERAIN_SEE_TERM_PRESET == 1
+#elif MAGNUS_SEE_TERM_PRESET == 1
 constexpr SeeScalePreset HISTORY_ORDERING_SEE_TERM_PRESET = SeeScalePreset::Medium;
-#elif VALERAIN_SEE_TERM_PRESET == 2
+#elif MAGNUS_SEE_TERM_PRESET == 2
 constexpr SeeScalePreset HISTORY_ORDERING_SEE_TERM_PRESET = SeeScalePreset::Strong;
 #else
-#error "VALERAIN_SEE_TERM_PRESET must be 0 (Weak), 1 (Medium), or 2 (Strong)"
+#error "MAGNUS_SEE_TERM_PRESET must be 0 (Weak), 1 (Medium), or 2 (Strong)"
 #endif
 
 struct KillerTable {
@@ -204,6 +210,23 @@ struct PawnHistoryTable {
 HistoryTables separates quiet and capture experience, while keeping killers and
 countermove hints in one place for move ordering and light pruning signals.
 */
+/*
+ * HistoryTables — 歷史啟發式查表集合
+ *
+ * 包含以下子表（全部以 [Color][PieceType][Square] 或類似維度索引）：
+ *   quiet_history     — 安靜著法歷史（主歷史表）
+ *   capture_history   — 捕獲著法歷史
+ *   continuation[4]   — 延續歷史（基於前序著法對，深度 1-4）
+ *   countermove       — 反著表（對前一步的直接回應）
+ *   pawn_history      — 兵結構歷史（基於兵 hash）
+ *   see_bias          — SEE 偏差表（按深度類別×SEE類別調整捕獲排序）
+ *   killers           — 殺手著法表 [MAX_PLY][2]
+ *
+ * 更新機制：
+ *   bonus  — 著法導致截斷時增加權重（增量 = depth²）
+ *   penalty — 被搜索但未截斷的著法減少權重（減量 = depth²×4）
+ *   所有更新使用指數加權移動平均 (exponential moving average)
+ */
 struct HistoryTables {
     KillerTable killers{};
     QuietHistoryTable quiet{};
@@ -289,7 +312,7 @@ struct HistoryTables {
         if (move_is_capture(move) || move_is_none(prev_move))
             return 0;
 
-        return countermove_fast(pos, prev_move) == move ? VALERAIN_COUNTERMOVE_BONUS : 0;
+        return countermove_fast(pos, prev_move) == move ? MAGNUS_COUNTERMOVE_BONUS : 0;
     }
     [[nodiscard]] inline i32 continuation_value_fast(
         const Position& pos,
@@ -317,13 +340,13 @@ struct HistoryTables {
             return 0;
 
         i32 score = 0;
-        score += VALERAIN_QUIET_HISTORY_WEIGHT * quiet_value_fast(pos, move);
-        score += (VALERAIN_COUNTERMOVE_WEIGHT_NUM * countermove_bonus_fast(pos, move, prev_move))
-            / VALERAIN_COUNTERMOVE_WEIGHT_DEN;
-        score += (VALERAIN_CONT1_WEIGHT_NUM * continuation_value_fast(pos, move, prev_move))
-            / VALERAIN_CONT1_WEIGHT_DEN;
-        score += (VALERAIN_CONT2_WEIGHT_NUM * continuation_value_fast(pos, move, prev2_move))
-            / VALERAIN_CONT2_WEIGHT_DEN;
+        score += MAGNUS_QUIET_HISTORY_WEIGHT * quiet_value_fast(pos, move);
+        score += (MAGNUS_COUNTERMOVE_WEIGHT_NUM * countermove_bonus_fast(pos, move, prev_move))
+            / MAGNUS_COUNTERMOVE_WEIGHT_DEN;
+        score += (MAGNUS_CONT1_WEIGHT_NUM * continuation_value_fast(pos, move, prev_move))
+            / MAGNUS_CONT1_WEIGHT_DEN;
+        score += (MAGNUS_CONT2_WEIGHT_NUM * continuation_value_fast(pos, move, prev2_move))
+            / MAGNUS_CONT2_WEIGHT_DEN;
         score += pawn_history_value_fast(pos, move);
         return score;
     }
@@ -337,10 +360,10 @@ struct HistoryTables {
             return 0;
 
         i32 score = 0;
-        score += VALERAIN_CAPTURE_HISTORY_WEIGHT * capture_value_fast(pos, move);
-        score += VALERAIN_CAPTURE_IMM_SEE_WEIGHT
+        score += MAGNUS_CAPTURE_HISTORY_WEIGHT * capture_value_fast(pos, move);
+        score += MAGNUS_CAPTURE_IMM_SEE_WEIGHT
             * see_immediate_term(see_value, HISTORY_ORDERING_SEE_TERM_PRESET);
-        score += VALERAIN_CAPTURE_SEE_BIAS_WEIGHT * see_bias_value_fast(depth, see_value);
+        score += MAGNUS_CAPTURE_SEE_BIAS_WEIGHT * see_bias_value_fast(depth, see_value);
         return score;
     }
 
@@ -389,9 +412,9 @@ struct HistoryTables {
         const int dc = static_cast<int>(dc_class);
         const int sc = static_cast<int>(classify_see_bias(see_value));
         i16& h = see_bias.value[dc][sc];
-        int bonus_div = VALERAIN_SEE_BIAS_BONUS_DIV;
+        int bonus_div = MAGNUS_SEE_BIAS_BONUS_DIV;
         if (dc_class == DepthClass::MediumLow)
-            bonus_div = VALERAIN_SEE_BIAS_MED_LOW_BONUS_DIV;
+            bonus_div = MAGNUS_SEE_BIAS_MED_LOW_BONUS_DIV;
         const i32 bonus = std::max(1, history_bonus(depth) / bonus_div);
         const i32 next = static_cast<i32>(h) + bonus;
         h = static_cast<i16>(std::clamp(next, -2048, 2048));
@@ -401,7 +424,7 @@ struct HistoryTables {
         const int sc = static_cast<int>(classify_see_bias(see_value));
         i16& h = see_bias.value[dc][sc];
         const i32 penalty =
-            history_bonus(depth) / (VALERAIN_SEE_BIAS_BONUS_DIV * VALERAIN_SEE_BIAS_FAIL_SCALE);
+            history_bonus(depth) / (MAGNUS_SEE_BIAS_BONUS_DIV * MAGNUS_SEE_BIAS_FAIL_SCALE);
         if (penalty <= 0)
             return;
         const i32 next = static_cast<i32>(h) - penalty;
@@ -563,4 +586,4 @@ struct HistoryTables {
     }
 };
 
-} // namespace valerain::search
+} // namespace magnus::search

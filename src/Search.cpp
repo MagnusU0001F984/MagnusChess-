@@ -28,12 +28,10 @@ SOFTWARE.
 #include <array>
 #include <bit>
 #include <chrono>
-#include <condition_variable>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <memory>
-#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -47,18 +45,47 @@ SOFTWARE.
 #include "See.h"
 
 /*
-This file implements a compact classical search:
-- iterative deepening at the root
-- principal variation search in the main tree
-- quiescence search on the tactical frontier
-- transposition-table guided ordering and cutoffs
-- a restrained set of low-overhead pruning heuristics
-*/
+ * MagnusChess 搜尋引擎核心 — Search Engine Core
+ *
+ * 採用經典的迭代加深 + 主變例搜尋 (PVS) 架構，包含以下關鍵組件：
+ *
+ * 1. 反覆加深 (Iterative Deepening)
+ *    - 從深度 1 逐步增加到最大深度
+ *    - 每層使用 aspiration window 加速收斂
+ *    - Stockfish 風格的時間管理決定何時停止
+ *
+ * 2. 主變例搜尋 (PVS — Principal Variation Search)
+ *    - 第一個著法用完整窗口搜索
+ *    - 後續著法用零窗口 (null window) 搜索
+ *    - 零窗口 fail-high 時觸發完整窗口 re-search
+ *
+ * 3. 靜態搜索 (Quiescence Search)
+ *    - 只搜索戰術著法（捕獲、升變）
+ *    - stand-pat 原則：靜態評估已達 beta 即可截斷
+ *    - delta pruning 跳過無法提升 alpha 的捕獲
+ *
+ * 4. 剪枝技術
+ *    - 空步剪枝 (NMP) — 給對方免費回合測試截斷
+ *    - 反向虛無剪枝 (RFP) — 靜態評估遠高於 beta 時提前截斷
+ *    - 剃刀剪枝 (Razoring) — 淺層評估極差時跳至 qsearch
+ *    - 機率截斷 (ProbCut) — 用淺層搜索預測深層截斷
+ *    - 奇異延伸 (Singular Extension) — TT 著法為唯一好著時延伸
+ *    - 延遲著法減免 (LMR) — 排序靠後的著法用縮減深度搜索
+ *    - 歷史啟發式剪枝 — 歷史分數極差的安靜著法直接跳過
+ *    - 捕獲 futility 剪枝 — 淺層捕獲不可能達到 alpha 時跳過
+ *
+ * 5. 並行搜索 (Lazy SMP)
+ *    - 多線程各自獨立搜索，共享置換表
+ *    - 加權投票選擇最佳著法
+ *
+ * 核心結構體 Searcher 封裝了單次迭代加深會話的所有可變狀態。
+ */
 
-namespace valerain::search {
+namespace magnus::search {
 
 namespace {
 
+// Pruning and reduction margins — tuned via SPSA / Texel tuning.
 // Small fixed margins keep the implementation simple and the runtime overhead low.
 constexpr int VALUE_INF = 32000;
 constexpr int VALUE_MATE = 31000;
@@ -96,6 +123,9 @@ constexpr int SINGULAR_MARGIN_PER_DEPTH = 4;
 constexpr int SINGULAR_DOUBLE_MARGIN_BASE = 48;
 constexpr int SINGULAR_DOUBLE_MARGIN_PER_DEPTH = 8;
 constexpr int SINGULAR_DOUBLE_MIN_DEPTH = 12;
+constexpr int SINGULAR_TRIPLE_MARGIN_BASE = 72;
+constexpr int SINGULAR_TRIPLE_MARGIN_PER_DEPTH = 12;
+constexpr int SINGULAR_TRIPLE_MIN_DEPTH = 18;
 constexpr int SEE_LATE_BAD_CAPTURE_GATE_MIN_DEPTH = 4;
 constexpr int SEE_LATE_BAD_CAPTURE_GATE_MAX_DEPTH = 8;
 constexpr int SEE_LATE_BAD_CAPTURE_GATE_MIN_CAPTURE_INDEX = 4;
@@ -111,61 +141,57 @@ constexpr int CORRECTION_WEIGHT_SUM =
     + CORRECTION_PAWN_WEIGHT
     + CORRECTION_MATERIAL_WEIGHT;
 
-#ifndef VALERAIN_SEARCH_OBS
-#define VALERAIN_SEARCH_OBS 0
+#ifndef MAGNUS_SEARCH_OBS
+#define MAGNUS_SEARCH_OBS 0
 #endif
 
-#ifndef VALERAIN_SEARCHSTATS_OBS
-#define VALERAIN_SEARCHSTATS_OBS 0
+#ifndef MAGNUS_SEARCHSTATS_OBS
+#define MAGNUS_SEARCHSTATS_OBS 0
 #endif
 
-#ifndef VALERAIN_ENABLE_PROBCUT
-#define VALERAIN_ENABLE_PROBCUT 1
+#ifndef MAGNUS_ENABLE_PROBCUT
+#define MAGNUS_ENABLE_PROBCUT 1
 #endif
 
-#ifndef VALERAIN_ENABLE_SMALL_PROBCUT
-#define VALERAIN_ENABLE_SMALL_PROBCUT 1
+#ifndef MAGNUS_ENABLE_SMALL_PROBCUT
+#define MAGNUS_ENABLE_SMALL_PROBCUT 1
 #endif
 
-#ifndef VALERAIN_ENABLE_SINGULAR_EXTENSION
-#define VALERAIN_ENABLE_SINGULAR_EXTENSION 1
+#ifndef MAGNUS_ENABLE_SINGULAR_EXTENSION
+#define MAGNUS_ENABLE_SINGULAR_EXTENSION 1
 #endif
 
-#ifndef VALERAIN_SEE_LATE_BAD_CAPTURE_GATE_THRESHOLD
-#define VALERAIN_SEE_LATE_BAD_CAPTURE_GATE_THRESHOLD -60
+#ifndef MAGNUS_SEE_LATE_BAD_CAPTURE_GATE_THRESHOLD
+#define MAGNUS_SEE_LATE_BAD_CAPTURE_GATE_THRESHOLD -60
 #endif
 constexpr int SEE_LATE_BAD_CAPTURE_GATE_THRESHOLD =
-    VALERAIN_SEE_LATE_BAD_CAPTURE_GATE_THRESHOLD;
+    MAGNUS_SEE_LATE_BAD_CAPTURE_GATE_THRESHOLD;
 
-#ifndef VALERAIN_SEE_TERM_PRESET
-#define VALERAIN_SEE_TERM_PRESET 1
+#ifndef MAGNUS_SEE_TERM_PRESET
+#define MAGNUS_SEE_TERM_PRESET 1
 #endif
 
-#if VALERAIN_SEE_TERM_PRESET == 0
+#if MAGNUS_SEE_TERM_PRESET == 0
 constexpr SeeScalePreset SEE_TERM_PRESET = SeeScalePreset::Weak;
-#elif VALERAIN_SEE_TERM_PRESET == 1
+#elif MAGNUS_SEE_TERM_PRESET == 1
 constexpr SeeScalePreset SEE_TERM_PRESET = SeeScalePreset::Medium;
-#elif VALERAIN_SEE_TERM_PRESET == 2
+#elif MAGNUS_SEE_TERM_PRESET == 2
 constexpr SeeScalePreset SEE_TERM_PRESET = SeeScalePreset::Strong;
 #else
-#error "VALERAIN_SEE_TERM_PRESET must be 0 (Weak), 1 (Medium), or 2 (Strong)"
+#error "MAGNUS_SEE_TERM_PRESET must be 0 (Weak), 1 (Medium), or 2 (Strong)"
 #endif
 
-#ifndef VALERAIN_CAPTURE_OBS
-#define VALERAIN_CAPTURE_OBS 0
+#ifndef MAGNUS_CAPTURE_OBS
+#define MAGNUS_CAPTURE_OBS 0
 #endif
 
-#ifndef VALERAIN_SEE_LATE_BAD_CAPTURE_GATE
-#define VALERAIN_SEE_LATE_BAD_CAPTURE_GATE 1
+#ifndef MAGNUS_SEE_LATE_BAD_CAPTURE_GATE
+#define MAGNUS_SEE_LATE_BAD_CAPTURE_GATE 1
 #endif
 
-#ifndef VALERAIN_MOVEPICKER_OBS
-#define VALERAIN_MOVEPICKER_OBS 0
+#ifndef MAGNUS_MOVEPICKER_OBS
+#define MAGNUS_MOVEPICKER_OBS 0
 #endif
-
-constexpr int piece_order_value[PIECE_TYPE_NB] = {
-    100, 320, 330, 500, 900, 0
-};
 
 [[nodiscard]] static inline int mvv_lva_capture_term(
     const Position& pos,
@@ -226,7 +252,7 @@ struct Searcher {
         int stand_pat = 0;
     };
 
-#if VALERAIN_SEARCHSTATS_OBS
+#if MAGNUS_SEARCHSTATS_OBS
     struct SearchStats {
         u64 root_moves_searched = 0;
         u64 root_pvs_researches = 0;
@@ -270,11 +296,11 @@ struct Searcher {
     bool stopped = false;
     bool hard_stop = false;
     int nmp_min_ply = 0;
-#if VALERAIN_SEARCHSTATS_OBS
+#if MAGNUS_SEARCHSTATS_OBS
     SearchStats stats{};
 #endif
 
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
     struct CaptureObservation {
         u64 main_capture_searches = 0;
         u64 main_capture_cutoffs = 0;
@@ -318,7 +344,7 @@ struct Searcher {
     } cap_obs{};
 #endif
 
-#if VALERAIN_MOVEPICKER_OBS
+#if MAGNUS_MOVEPICKER_OBS
     enum class MoveStageBucket : std::uint8_t {
         TT = 0,
         GoodCapture,
@@ -353,7 +379,7 @@ struct Searcher {
     } mp_obs{};
 #endif
 
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
     struct SearchObservation {
         u64 nmp_candidates = 0;
         u64 nmp_tried = 0;
@@ -367,13 +393,14 @@ struct Searcher {
         u64 singular_candidates = 0;
         u64 singular_extend1 = 0;
         u64 singular_extend2 = 0;
+        u64 singular_extend3 = 0;
     } search_obs{};
 #endif
 
     explicit Searcher(memory::Memory& m, const SearchLimits& l) noexcept
         : mem(m), limits(l) {}
 
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
     [[nodiscard]] static inline int see_bucket(int see_value) noexcept {
         if (see_value < 0) return 0;
         if (see_value == 0) return 1;
@@ -628,7 +655,7 @@ struct Searcher {
     }
 #endif
 
-#if VALERAIN_MOVEPICKER_OBS
+#if MAGNUS_MOVEPICKER_OBS
     [[nodiscard]] static inline int mp_ratio_percent(u64 num, u64 den) noexcept {
         if (den == 0)
             return 0;
@@ -698,7 +725,7 @@ struct Searcher {
     }
 #endif
 
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
     [[nodiscard]] static inline int search_ratio_percent(u64 num, u64 den) noexcept {
         if (den == 0)
             return 0;
@@ -722,7 +749,8 @@ struct Searcher {
         out << "info string searchobs singular "
             << search_obs.singular_extend1 << '/' << search_obs.singular_candidates
             << " (" << search_ratio_percent(search_obs.singular_extend1, search_obs.singular_candidates) << "%)"
-            << " double " << search_obs.singular_extend2 << '\n';
+            << " double " << search_obs.singular_extend2
+            << " triple " << search_obs.singular_extend3 << '\n';
     }
 #endif
 
@@ -825,7 +853,8 @@ struct Searcher {
     [[nodiscard]] static inline int futility_margin(
         int depth,
         bool improving,
-        int history_score
+        int history_score,
+        int correction = 0
     ) noexcept {
         return FUTILITY_BASE_MARGIN
             + depth * FUTILITY_DEPTH_MARGIN
@@ -834,7 +863,8 @@ struct Searcher {
                 history_score / FUTILITY_HISTORY_DIVISOR,
                 -64,
                 64
-            );
+            )
+            + std::clamp(correction / 4, -32, 32); // eval confidence feedback
     }
 
     [[nodiscard]] static inline int lmp_limit(int depth, bool improving) noexcept {
@@ -1030,14 +1060,8 @@ struct Searcher {
         return raw_eval;
     }
 
-    [[nodiscard]] static inline int shape_internal_search_score(int mixed_eval) noexcept {
-        return mixed_eval;
-    }
-
     [[nodiscard]] inline int evaluate_search_position(const Position& pos) const noexcept {
-        return shape_internal_search_score(
-            base_search_eval_from_raw(evaluate_raw_position(pos), pos)
-        );
+        return base_search_eval_from_raw(evaluate_raw_position(pos), pos);
     }
 
     [[nodiscard]] static inline bool tt_raw_eval_available(
@@ -1225,7 +1249,7 @@ struct Searcher {
         int eval_hint
     ) const noexcept {
         const int base_draw = draw_score(side_to_move);
-        if (eval_hint == VALUE_NONE)
+        if (eval_hint == VALUE_NONE || limits.contempt == 0)
             return base_draw;
 
         const int avoid_swing = std::max(
@@ -1370,11 +1394,7 @@ struct Searcher {
             -VALUE_INF,
             VALUE_INF
         );
-        info.search = std::clamp(
-            shape_internal_search_score(mixed_eval),
-            -VALUE_INF,
-            VALUE_INF
-        );
+        info.search = std::clamp(mixed_eval, -VALUE_INF, VALUE_INF);
         info.stand_pat = info.search;
 
         if (!qsearch_node || checked || !probe.hit)
@@ -1423,7 +1443,8 @@ struct Searcher {
         Move move,
         Move tt_move,
         int ply,
-        int depth
+        int depth,
+        int* see_out = nullptr
     ) const noexcept {
         // Ordering priority:
         // 1. TT move
@@ -1437,6 +1458,7 @@ struct Searcher {
         if (move_is_capture(move)) {
             const int mvv_lva_term = mvv_lva_capture_term(pos, move);
             const int see_value = search::see_value(pos, mem, move);
+            if (see_out) *see_out = see_value;
             const int immediate_see_term = see_immediate_term(see_value, SEE_TERM_PRESET);
             const int see_bias_term = history_tables.see_bias_value_fast(depth, see_value);
             return 20'000'000 + mvv_lva_term
@@ -1466,8 +1488,10 @@ struct Searcher {
     ) const noexcept {
         scored.size = moves.size;
         for (int i = 0; i < moves.size; ++i) {
+            int see_value = 0;
             scored.moves[i].move = moves.moves[i];
-            scored.moves[i].score = score_move(pos, moves.moves[i], tt_move, ply, depth);
+            scored.moves[i].score = score_move(pos, moves.moves[i], tt_move, ply, depth, &see_value);
+            scored.moves[i].see_value = see_value;
         }
     }
 
@@ -1557,10 +1581,11 @@ struct Searcher {
                 continue;
 
             ++legal_count;
+            const int cached_see = scored.moves[i].see_value;
 
             if (!checked &&
                 !move_is_promotion(move) &&
-                !search::see_ge(pos, mem, move, -DELTA_MARGIN)) {
+                cached_see < -DELTA_MARGIN) {
                 continue;
             }
 
@@ -1571,12 +1596,12 @@ struct Searcher {
                     continue;
             }
 
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
             const bool capture_move = move_is_capture(move);
             int obs_see_value = 0;
             int obs_capture_hist = 0;
             if (capture_move) {
-                obs_see_value = search::see_value_fast(pos, mem, move);
+                obs_see_value = cached_see;
                 obs_capture_hist = history_tables.capture_value_fast(pos, move);
                 record_q_capture_try(obs_see_value, obs_capture_hist);
             }
@@ -1593,7 +1618,7 @@ struct Searcher {
                 best_move = move;
                 update_pv(ply, move);
                 if (alpha >= beta) {
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
                     if (move_is_capture(move))
                         record_q_capture_cutoff(obs_see_value, obs_capture_hist);
 #endif
@@ -1669,6 +1694,7 @@ struct Searcher {
             !exclusion_search) {
             --search_depth;
         }
+        const int tt_store_depth = search_depth;
 
         int tt_score = 0;
         if (!exclusion_search &&
@@ -1686,6 +1712,7 @@ struct Searcher {
         const bool opponent_worsening = !checked && ply > 0
             && static_eval_valid[ply - 1]
             && static_eval > -static_eval_stack[ply - 1];
+        const bool can_prune = !pv_node && !checked;
 
         // Hindsight depth adjustment: compensate for prior LMR under/over-reduction.
         const int prior_reduction_plies = ply > 0
@@ -1709,8 +1736,7 @@ struct Searcher {
         ss.tt_hit = probe.hit;
         ss.tt_pv = pv_node;
 
-        if (!pv_node &&
-            !checked &&
+        if (can_prune &&
             search_depth <= 2 &&
             static_eval + RAZOR_MARGIN[search_depth] <= alpha) {
             // Razoring: at very shallow depth, a bad static eval can defer to qsearch.
@@ -1719,8 +1745,7 @@ struct Searcher {
                 return score;
         }
 
-        if (!pv_node &&
-            !checked &&
+        if (can_prune &&
             search_depth <= 6 &&
             !is_mate_window(beta) &&
             static_eval - reverse_futility_margin(
@@ -1739,7 +1764,7 @@ struct Searcher {
         }
 
         const bool nmp_disabled_here = nmp_disabled_for_ply(ply, nmp_min_ply);
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
         if (allow_null &&
             !pv_node &&
             !checked &&
@@ -1775,7 +1800,7 @@ struct Searcher {
         if (nmp.eligible && !is_mate_window(beta) && !nmp_disabled_here) {
             // Null-move pruning tests whether simply passing still keeps the
             // position above beta. If so, the real position is likely also a cutoff.
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
             ++search_obs.nmp_tried;
 #endif
             NullMoveState null_state;
@@ -1793,15 +1818,15 @@ struct Searcher {
             undo_null_move(pos, null_state);
 
             if (score >= beta && !is_mate_window(score)) {
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                 ++search_obs.nmp_fail_high;
 #endif
                 if (!nmp.requires_verification) {
-                    save_tt(pos, search_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
+                    save_tt(pos, tt_store_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
                     return score;
                 }
 
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                 ++search_obs.nmp_verification_tried;
 #endif
                 const int old_nmp_min_ply = nmp_min_ply;
@@ -1817,14 +1842,14 @@ struct Searcher {
                 nmp_min_ply = old_nmp_min_ply;
 
                 if (verify_score >= beta) {
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                     ++search_obs.nmp_verified_cutoffs;
 #endif
-                    save_tt(pos, search_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
+                    save_tt(pos, tt_store_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
                     return score;
                 }
 
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                 ++search_obs.nmp_verification_failed;
 #endif
             }
@@ -1843,13 +1868,12 @@ struct Searcher {
             }
         }
 
-#if VALERAIN_ENABLE_PROBCUT
-        if (!pv_node &&
-            !checked &&
+#if MAGNUS_ENABLE_PROBCUT
+        if (can_prune &&
             !exclusion_search &&
             search_depth >= PROBCUT_MIN_DEPTH &&
             !is_mate_window(beta)) {
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
             ++search_obs.probcut_nodes;
 #endif
             const int probcut_beta = beta + PROBCUT_MARGIN;
@@ -1876,9 +1900,9 @@ struct Searcher {
                         continue;
                     if (!legal_fast(pos, mem, info, move))
                         continue;
-                    if (!search::see_ge_fast(pos, mem, move, 0))
+                    if (scored_probcut.moves[i].see_value < 0)
                         continue;
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                     ++search_obs.probcut_moves;
 #endif
 
@@ -1904,10 +1928,10 @@ struct Searcher {
                     unmake_move(pos, move, mem.tables, st);
 
                     if (score >= probcut_beta) {
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                         ++search_obs.probcut_cutoffs;
 #endif
-                        save_tt(pos, search_depth - 3, ply, score, raw_eval, move, alpha0, beta, pv_node);
+                        save_tt(pos, tt_store_depth - 3, ply, score, raw_eval, move, alpha0, beta, pv_node);
                         return score;
                     }
                 }
@@ -1915,7 +1939,7 @@ struct Searcher {
         }
 #endif
 
-#if VALERAIN_ENABLE_SMALL_PROBCUT
+#if MAGNUS_ENABLE_SMALL_PROBCUT
         {
             constexpr int SMALL_PROBCUT_MARGIN = 416;
             const int small_probcut_beta = beta + SMALL_PROBCUT_MARGIN;
@@ -1963,7 +1987,7 @@ struct Searcher {
             search_depth,
             quiet_control
         );
-#if VALERAIN_MOVEPICKER_OBS
+#if MAGNUS_MOVEPICKER_OBS
         ++mp_obs.nodes;
         if (!move_is_none(tt_move))
             ++mp_obs.nodes_with_tt_probe;
@@ -1974,23 +1998,27 @@ struct Searcher {
         bool seen_first_quiet = false;
 #endif
 
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
         Move capture_moves[MAX_MOVES];
         int capture_base_scores[MAX_MOVES];
         int capture_base_ranks[MAX_MOVES];
         int capture_count = 0;
-        MoveList capture_list;
-        Move* cend = generate_pseudo_captures(pos, mem, info, capture_list.moves);
-        capture_list.size = static_cast<int>(cend - capture_list.moves);
-        for (int i = 0; i < capture_list.size; ++i) {
-            const Move move = capture_list.moves[i];
-            if (!move_is_capture(move))
-                continue;
-            if (!legal_fast(pos, mem, info, move))
-                continue;
-            capture_moves[capture_count] = move;
-            capture_base_scores[capture_count] = mvv_lva_capture_term(pos, move);
-            ++capture_count;
+        // Reuse MovePicker's already-generated capture lists instead of regenerating.
+        {
+            const int good_cnt = picker.good_capture_count();
+            for (int i = 0; i < good_cnt; ++i) {
+                const Move m = picker.good_captures()[i].move;
+                capture_moves[capture_count] = m;
+                capture_base_scores[capture_count] = mvv_lva_capture_term(pos, m);
+                ++capture_count;
+            }
+            const int bad_cnt = picker.bad_capture_count();
+            for (int i = 0; i < bad_cnt; ++i) {
+                const Move m = picker.bad_captures()[i].move;
+                capture_moves[capture_count] = m;
+                capture_base_scores[capture_count] = mvv_lva_capture_term(pos, m);
+                ++capture_count;
+            }
         }
         for (int i = 0; i < capture_count; ++i) {
             int rank = 1;
@@ -2012,6 +2040,7 @@ struct Searcher {
         int searched_capture_see[MAX_MOVES];
         int searched_capture_count = 0;
         int simple_capture_count = 0;
+        int capture_index = 0;
         int moves_tried = 0;
         int best_score = -VALUE_INF;
         bool cutoff = false;
@@ -2055,13 +2084,13 @@ struct Searcher {
                 !pv_node &&
                 !checked &&
                 search_depth >= 3 &&
-                move_index >= 3;
+                move_index >= 2;
             const bool lmr_capture_candidate =
                 simple_capture &&
                 !pv_node &&
                 !checked &&
                 search_depth >= 4 &&
-                (simple_capture_count - 1) >= 2;
+                simple_capture_count >= 2;
             bool gives_check = false;
             bool gives_check_known = false;
             const auto ensure_gives_check = [&]() noexcept {
@@ -2071,7 +2100,7 @@ struct Searcher {
                 }
                 return gives_check;
             };
-#if VALERAIN_MOVEPICKER_OBS
+#if MAGNUS_MOVEPICKER_OBS
             const bool first_move_this = (moves_tried == 1);
             const MoveStageBucket stage_bucket = classify_stage_bucket(
                 move, tt_move, killer1, killer2, capture_move, bad_capture
@@ -2100,10 +2129,12 @@ struct Searcher {
 
             if (quiet_move)
                 ++quiet_count;
-            if (simple_capture)
+            if (simple_capture) {
+                capture_index = simple_capture_count;
                 ++simple_capture_count;
+            }
 
-#if VALERAIN_SEE_LATE_BAD_CAPTURE_GATE
+#if MAGNUS_SEE_LATE_BAD_CAPTURE_GATE
             if (!pv_node &&
                 !checked &&
                 simple_capture &&
@@ -2122,13 +2153,13 @@ struct Searcher {
 
                     if (!exempt_recapture && !exempt_check) {
                         pruned = true;
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
                         record_gate_check(bad_see, pruned, exempt_check, exempt_recapture);
 #endif
                         continue;
                     }
                 }
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
                 record_gate_check(bad_see, pruned, exempt_check, exempt_recapture);
 #endif
             }
@@ -2143,6 +2174,8 @@ struct Searcher {
                 search_depth <= 7) {
                 const PieceType captured_pt = move_is_ep(move) ? PAWN : piece_type_on(pos, to_sq(move));
                 const int captured_value = is_ok(captured_pt) ? piece_order_value[captured_pt] : 0;
+                // SPSA-tuned capture futility margin: base intercept + depth slope
+                // + material gain + scaled capture-history signal.
                 const int cap_futility = static_eval + 218 + 223 * search_depth
                     + captured_value + 131 * capture_history_score / 1024;
                 if (cap_futility <= alpha)
@@ -2173,7 +2206,7 @@ struct Searcher {
                 search_depth <= 4 &&
                 quiet_move &&
                 !ensure_gives_check() &&
-                static_eval + futility_margin(search_depth, improving, history_score) <= alpha) {
+                static_eval + futility_margin(search_depth, improving, history_score, correction) <= alpha) {
                 // Shallow futility pruning skips quiet moves that cannot raise alpha.
                 continue;
             }
@@ -2201,7 +2234,7 @@ struct Searcher {
                 continue;
             }
 
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
             int obs_capture_order = -1;
             int obs_see_value = 0;
             int obs_capture_hist = 0;
@@ -2219,21 +2252,36 @@ struct Searcher {
 #endif
 
             int move_extension = 0;
-#if VALERAIN_ENABLE_SINGULAR_EXTENSION
-            if (move == tt_move &&
+#if MAGNUS_ENABLE_SINGULAR_EXTENSION
+            // Dynamic singular extension: also trigger on PV EXACT-bound TT entries
+            // whose score already reaches beta, widening the detection net.
+            const bool singular_eligible =
+                move == tt_move &&
                 !checked &&
                 !exclusion_search &&
                 search_depth >= SINGULAR_MIN_DEPTH &&
                 probe.hit &&
-                tt_bound == memory::BOUND_LOWER &&
+                (tt_bound == memory::BOUND_LOWER ||
+                 (tt_bound == memory::BOUND_EXACT && probed_tt_score >= beta)) &&
                 probe.data.depth >= search_depth - SINGULAR_TT_DEPTH_MARGIN &&
-                !is_mate_window(probed_tt_score)) {
-#if VALERAIN_SEARCH_OBS
+                !is_mate_window(probed_tt_score);
+
+            if (singular_eligible) {
+#if MAGNUS_SEARCH_OBS
                 ++search_obs.singular_candidates;
 #endif
+                // Node-type adaptive margin: cut-nodes use larger margin (harder to trigger),
+                // PV-nodes use smaller margin (easier to trigger — more important).
+                int singular_margin_base = SINGULAR_MARGIN_BASE;
+                if (tt_bound == memory::BOUND_LOWER || !move_is_none(tt_move))
+                    singular_margin_base += 12; // cut-node
+                else if (pv_node)
+                    singular_margin_base -= 8;  // PV-node
                 const int singular_beta =
-                    probed_tt_score - (SINGULAR_MARGIN_BASE + SINGULAR_MARGIN_PER_DEPTH * search_depth);
-                const int singular_depth = std::max(1, search_depth / 2 - 1);
+                    probed_tt_score - (singular_margin_base + SINGULAR_MARGIN_PER_DEPTH * search_depth);
+                // Deeper adaptive verification: 3/4 depth gives more reliable
+                // singularity detection than the classic 1/2 depth.
+                const int singular_depth = std::max(1, search_depth * 3 / 4 - 2);
                 const int singular_score = pvs(
                     pos,
                     singular_depth,
@@ -2246,7 +2294,7 @@ struct Searcher {
 
                 if (singular_score < singular_beta) {
                     move_extension = 1;
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                     ++search_obs.singular_extend1;
 #endif
                     if (search_depth >= SINGULAR_DOUBLE_MIN_DEPTH &&
@@ -2255,9 +2303,19 @@ struct Searcher {
                             + SINGULAR_DOUBLE_MARGIN_PER_DEPTH * search_depth
                         )) {
                         move_extension = 2;
-#if VALERAIN_SEARCH_OBS
+#if MAGNUS_SEARCH_OBS
                         ++search_obs.singular_extend2;
 #endif
+                        if (search_depth >= SINGULAR_TRIPLE_MIN_DEPTH &&
+                            singular_score < singular_beta - (
+                                SINGULAR_TRIPLE_MARGIN_BASE
+                                + SINGULAR_TRIPLE_MARGIN_PER_DEPTH * search_depth
+                            )) {
+                            move_extension = 3;
+#if MAGNUS_SEARCH_OBS
+                            ++search_obs.singular_extend3;
+#endif
+                        }
                     }
                 }
                 // Multi-cut pruning: if excluding the TT move still fails high
@@ -2266,12 +2324,17 @@ struct Searcher {
                     return singular_score;
                 }
                 // Negative extensions: TT move is not singular.
-                else if (probed_tt_score >= beta) {
-                    move_extension = -3;
+                // Only apply in non-PV cut-nodes (LOWER bound), not for PV EXACT.
+                else if (tt_bound == memory::BOUND_LOWER) {
+                    if (probed_tt_score >= beta)
+                        move_extension = -3;
+                    else if (!pv_node && !move_is_none(tt_move))
+                        move_extension = -2;
                 }
-                else if (!pv_node && !move_is_none(tt_move)) {
-                    move_extension = -2;
-                }
+            }
+            if (move_extension < 0) {
+                const int max_negative = -(search_depth / 3);
+                move_extension = std::max(move_extension, max_negative);
             }
 #endif
             if (lmr_quiet_candidate || lmr_capture_candidate)
@@ -2305,11 +2368,13 @@ struct Searcher {
                 !move_is_none(tt_move) && move_is_capture(tt_move);
             lmr_node.next_ply_cutoff_count = search_stack[ply + 1].cutoff_count;
             lmr_node.parent_reduction_fp = ply > 0 ? search_stack[ply - 1].reduction_fp : 0;
+            lmr_node.tt_depth = probe.hit ? probe.data.depth : 0;
+            lmr_node.tt_bound = static_cast<int>(tt_bound);
 
             LmrMoveContext lmr_move{};
             lmr_move.move = move;
             lmr_move.move_index = move_index;
-            lmr_move.reduction_index = quiet_move ? move_index : (simple_capture_count - 1);
+            lmr_move.reduction_index = quiet_move ? move_index : capture_index;
             lmr_move.is_tt_move = move == tt_move;
             lmr_move.quiet = quiet_move;
             lmr_move.capture = capture_move;
@@ -2344,7 +2409,7 @@ struct Searcher {
                 searched_first = true;
             } else {
                 if (simple_capture) {
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
                     ++cap_obs.cap_lmr_late_simple_total;
                     if (search_depth >= 4 && simple_capture_count >= 3)
                         ++cap_obs.cap_lmr_eligible;
@@ -2362,7 +2427,7 @@ struct Searcher {
                         const int research_depth =
                             lmr_research_depth(lmr, new_depth, score, alpha, lmr_best_floor);
                         if (research_depth > reduced_depth) {
-#if VALERAIN_SEARCHSTATS_OBS
+#if MAGNUS_SEARCHSTATS_OBS
                             ++stats.lmr_researches;
                             ++stats.lmr_by_ply[std::min(ply, MAX_PLY - 1)];
                             if (quiet_move)
@@ -2393,7 +2458,7 @@ struct Searcher {
                     score = -pvs(pos, new_depth, -alpha - 1, -alpha, ply + 1, true);
                 }
 
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
                 if (simple_capture && lmr.eligible && score > alpha)
                     record_cap_lmr_research(move_see_value, lmr.final_reduction);
 #endif
@@ -2401,7 +2466,7 @@ struct Searcher {
                 if (score > alpha && score < beta) {
                     // A null-window fail-high inside the PV must be confirmed by
                     // a full-window re-search before the score is trusted.
-#if VALERAIN_SEARCHSTATS_OBS
+#if MAGNUS_SEARCHSTATS_OBS
                     ++stats.pvs_full_researches;
                     ++stats.pvs_full_by_ply[std::min(ply, MAX_PLY - 1)];
                     if (pv_node)
@@ -2417,7 +2482,7 @@ struct Searcher {
 
             if (quiet_move)
                 searched_quiets[searched_quiet_count++] = move;
-#if VALERAIN_MOVEPICKER_OBS
+#if MAGNUS_MOVEPICKER_OBS
             if (quiet_move)
                 ++mp_obs.quiet_searched;
 #endif
@@ -2434,7 +2499,7 @@ struct Searcher {
                 best_move = move;
                 update_pv(ply, move);
                 if (alpha >= beta) {
-#if VALERAIN_MOVEPICKER_OBS
+#if MAGNUS_MOVEPICKER_OBS
                     ++mp_obs.cutoffs_total;
                     ++mp_obs.cutoff_by_stage[static_cast<int>(stage_bucket)];
                     if (first_move_this && stage_bucket == MoveStageBucket::TT)
@@ -2450,7 +2515,7 @@ struct Searcher {
                     if (quiet_move && picker.last_quiet_suppressed())
                         ++mp_obs.quiet_fail_high_after_skip_band;
 #endif
-#if VALERAIN_CAPTURE_OBS
+#if MAGNUS_CAPTURE_OBS
                     if (capture_move)
                         record_main_capture_cutoff(
                             obs_capture_order, obs_see_value, obs_capture_hist
@@ -2465,10 +2530,16 @@ struct Searcher {
                         prev_move,
                         prev2_move
                     );
-                    // Deeper continuation history bonuses for the cutoff move.
+                    // Continuation history bonuses with linear depth decay (was quadratic).
                     if (!move_is_capture(move)) {
-                        history_tables.bonus_continuation_fast(pos, prev3_move, move, std::max(1, depth / 4));
-                        history_tables.bonus_continuation_fast(pos, prev4_move, move, std::max(1, depth / 4));
+                        history_tables.bonus_continuation_fast(pos, prev3_move, move, std::max(1, depth / 2));
+                        history_tables.bonus_continuation_fast(pos, prev4_move, move, std::max(1, depth / 2));
+                    }
+                    // Near-miss bonus: first few quiets that almost cut get a small reward.
+                    if (!move_is_capture(move) && searched_quiet_count > 1) {
+                        const int near_bonus_depth = std::max(1, depth / 4);
+                        for (int j = 0; j < std::min(3, searched_quiet_count); ++j)
+                            history_tables.bonus_fast(pos, searched_quiets[j], near_bonus_depth);
                     }
                     if (capture_move)
                         history_tables.penalize_captures_fast(pos, searched_captures, searched_capture_count, move, depth);
@@ -2498,7 +2569,7 @@ struct Searcher {
             }
         }
 
-#if VALERAIN_MOVEPICKER_OBS
+#if MAGNUS_MOVEPICKER_OBS
         mp_obs.quiet_generated += static_cast<u64>(picker.quiet_generated());
         mp_obs.quiet_scored += static_cast<u64>(picker.quiet_scored());
         mp_obs.quiet_skipped_by_mp += static_cast<u64>(picker.quiet_suppressed());
@@ -2509,7 +2580,7 @@ struct Searcher {
                 ? alpha
                 : (checked ? (-VALUE_MATE + ply) : draw_score(pos.side_to_move));
             if (!exclusion_search)
-                save_tt(pos, search_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
+                save_tt(pos, tt_store_depth, ply, score, raw_eval, 0, alpha0, beta, pv_node);
             return score;
         }
 
@@ -2561,7 +2632,7 @@ struct Searcher {
         }
 
         if (!exclusion_search)
-            save_tt(pos, search_depth, ply, alpha, raw_eval, best_move, alpha0, beta, pv_node);
+            save_tt(pos, tt_store_depth, ply, alpha, raw_eval, best_move, alpha0, beta, pv_node);
         return alpha;
     }
 
@@ -2592,7 +2663,7 @@ struct Searcher {
         } else {
             score = -pvs(local_root, depth - 1, -alpha - 1, -alpha, 1, true);
             if (score > alpha) {
-#if VALERAIN_SEARCHSTATS_OBS
+#if MAGNUS_SEARCHSTATS_OBS
                 ++stats.root_pvs_researches;
 #endif
                 score = -pvs(local_root, depth - 1, -beta, -alpha, 1, true);
@@ -2662,7 +2733,7 @@ struct Searcher {
                 break;
 
             const Move move = pick_next(scored, i);
-#if VALERAIN_SEARCHSTATS_OBS
+#if MAGNUS_SEARCHSTATS_OBS
             ++stats.root_moves_searched;
 #endif
             const RootMoveResult move_result =
@@ -2755,6 +2826,8 @@ struct IterationTimeState {
     bool should_stop = false;
     if (use_stockfish_style_time_management(searcher.limits) &&
         !searcher.pondering_active()) {
+        // SPSA-tuned time management: falling-eval scaling, sigmoid depth factor,
+        // and best-move instability combine to adjust soft-time allocation.
         double falling_eval =
             (11.85
              + 2.24 * double(previous_score - current.score)
@@ -2794,7 +2867,7 @@ struct IterationTimeState {
     return should_stop;
 }
 
-#if VALERAIN_SEARCHSTATS_OBS
+#if MAGNUS_SEARCHSTATS_OBS
 void emit_searchstat_ply_top(
     std::ostream& out,
     const char* label,
@@ -2893,71 +2966,6 @@ void emit_searchstats_line(
 }
 #endif
 
-struct OrderedRootSearch {
-    std::vector<Move> ordered_moves;
-    memory::TTProbe probe{};
-    Move root_hint = 0;
-    Searcher::StaticEvalInfo eval_info{};
-    bool checked = false;
-};
-
-struct RootParallelTask {
-    const Position* root = nullptr;
-    const std::vector<Move>* ordered_moves = nullptr;
-    int depth = 0;
-    int alpha0 = -VALUE_INF;
-    int beta = VALUE_INF;
-    int block_size = 2;
-    Searcher::clock::time_point start_time{};
-    std::atomic<int> next_index{0};
-    std::atomic<int> shared_alpha{0};
-    std::atomic<bool> cutoff{false};
-    std::mutex result_mutex;
-    SearchResult best{};
-    Move best_pv[MAX_PLY]{};
-    int best_pv_length = 0;
-    int max_seldepth = 0;
-
-    void submit(
-        Searcher& searcher,
-        Move move,
-        const Searcher::RootMoveResult& outcome
-    ) noexcept {
-        if (outcome.improved_alpha) {
-            int observed = shared_alpha.load(std::memory_order_relaxed);
-            while (outcome.score > observed &&
-                   !shared_alpha.compare_exchange_weak(
-                       observed,
-                       outcome.score,
-                       std::memory_order_relaxed,
-                       std::memory_order_relaxed
-                   )) {
-            }
-        }
-
-        std::scoped_lock lock(result_mutex);
-        max_seldepth = std::max(max_seldepth, searcher.seldepth);
-
-        if (best.best_move == 0 || outcome.score > best.score) {
-            best.best_move = move;
-            best.score = outcome.score;
-            best.depth = depth;
-            best.seldepth = searcher.seldepth;
-            if (outcome.improved_alpha) {
-                best_pv_length = searcher.pv_length[0];
-                for (int i = 0; i < best_pv_length; ++i)
-                    best_pv[i] = searcher.pv_table[0][i];
-            } else {
-                best_pv_length = 1;
-                best_pv[0] = move;
-            }
-        }
-
-        if (outcome.score >= beta)
-            cutoff.store(true, std::memory_order_relaxed);
-    }
-};
-
 struct RootWorker {
     SearchLimits limits;
     Searcher searcher;
@@ -2966,150 +2974,6 @@ struct RootWorker {
         : limits(base_limits), searcher(mem, limits) {}
 };
 
-void reset_searcher_iteration(
-    Searcher& searcher,
-    Searcher::clock::time_point start_time,
-    u64 base_nodes
-) noexcept;
-
-void search_root_blocks(Searcher& searcher, RootParallelTask& task) noexcept;
-
-struct RootThreadPool {
-    std::mutex mutex;
-    std::condition_variable work_cv;
-    std::condition_variable done_cv;
-    std::vector<std::unique_ptr<RootWorker>> workers;
-    std::vector<std::thread> threads;
-    RootParallelTask* active_task = nullptr;
-    Searcher::clock::time_point task_start_time{};
-    u64 task_base_nodes = 0;
-    int generation = 0;
-    int active_worker_count = 0;
-    int pending_workers = 0;
-    bool shutting_down = false;
-
-    RootThreadPool(memory::Memory& mem, const SearchLimits& base_limits) {
-        const int helper_count = std::max(0, base_limits.thread_count - 1);
-        workers.reserve(static_cast<std::size_t>(helper_count));
-        threads.reserve(static_cast<std::size_t>(helper_count));
-
-        for (int i = 0; i < helper_count; ++i) {
-            auto worker = std::make_unique<RootWorker>(mem, base_limits);
-            worker->limits.thread_id = i + 1;
-            worker->limits.thread_count = base_limits.thread_count;
-            worker->limits.report_info = false;
-            worker->limits.shared_nodes = nullptr;
-            workers.push_back(std::move(worker));
-        }
-
-        for (int i = 0; i < helper_count; ++i) {
-            threads.emplace_back([this, i]() noexcept {
-                run_worker(i);
-            });
-        }
-    }
-
-    ~RootThreadPool() {
-        {
-            std::scoped_lock lock(mutex);
-            shutting_down = true;
-            ++generation;
-        }
-        work_cv.notify_all();
-
-        for (std::thread& thread : threads) {
-            if (thread.joinable())
-                thread.join();
-        }
-    }
-
-    [[nodiscard]] int helper_capacity() const noexcept {
-        return static_cast<int>(workers.size());
-    }
-
-    void dispatch(
-        RootParallelTask& task,
-        Searcher::clock::time_point start_time,
-        u64 base_nodes,
-        std::atomic<u64>* shared_nodes,
-        int worker_count
-    ) {
-        if (worker_count <= 0)
-            return;
-
-        {
-            std::scoped_lock lock(mutex);
-            active_task = &task;
-            task_start_time = start_time;
-            task_base_nodes = base_nodes;
-            active_worker_count = std::min(worker_count, helper_capacity());
-            pending_workers = active_worker_count;
-
-            for (int i = 0; i < active_worker_count; ++i)
-                workers[static_cast<std::size_t>(i)]->limits.shared_nodes = shared_nodes;
-
-            for (int i = active_worker_count; i < helper_capacity(); ++i)
-                workers[static_cast<std::size_t>(i)]->limits.shared_nodes = nullptr;
-
-            ++generation;
-        }
-
-        work_cv.notify_all();
-    }
-
-    void wait() {
-        std::unique_lock lock(mutex);
-        done_cv.wait(lock, [this]() noexcept {
-            return pending_workers == 0;
-        });
-        active_task = nullptr;
-        active_worker_count = 0;
-
-        for (auto& worker : workers)
-            worker->limits.shared_nodes = nullptr;
-    }
-
-private:
-    void run_worker(int worker_index) noexcept {
-        RootWorker& worker = *workers[static_cast<std::size_t>(worker_index)];
-        int seen_generation = 0;
-
-        for (;;) {
-            RootParallelTask* task = nullptr;
-            Searcher::clock::time_point start_time{};
-            u64 base_nodes = 0;
-
-            {
-                std::unique_lock lock(mutex);
-                work_cv.wait(lock, [this, seen_generation]() noexcept {
-                    return shutting_down || generation != seen_generation;
-                });
-
-                if (shutting_down)
-                    return;
-
-                seen_generation = generation;
-                if (worker_index >= active_worker_count)
-                    continue;
-
-                task = active_task;
-                start_time = task_start_time;
-                base_nodes = task_base_nodes;
-            }
-
-            if (task != nullptr) {
-                reset_searcher_iteration(worker.searcher, start_time, base_nodes);
-                search_root_blocks(worker.searcher, *task);
-            }
-
-            {
-                std::scoped_lock lock(mutex);
-                if (pending_workers > 0 && --pending_workers == 0)
-                    done_cv.notify_one();
-            }
-        }
-    }
-};
 
 void reset_searcher_iteration(
     Searcher& searcher,
@@ -3138,37 +3002,6 @@ void reset_searcher_iteration(
     );
 }
 
-[[nodiscard]] int choose_root_seed_count(
-    std::size_t root_count,
-    int thread_count
-) noexcept {
-    if (root_count > 1 && root_count <= static_cast<std::size_t>(thread_count))
-        return 2;
-    return 1;
-}
-
-[[nodiscard]] int choose_root_block_size(
-    std::size_t root_count,
-    int thread_count
-) noexcept {
-    if (root_count <= 8)
-        return 1;
-    if (root_count >= 24 && thread_count >= 8)
-        return 4;
-    return 2;
-}
-
-[[nodiscard]] int choose_active_root_helpers(
-    int remaining_moves,
-    int block_size,
-    int helper_capacity
-) noexcept {
-    if (remaining_moves <= 0 || helper_capacity <= 0)
-        return 0;
-
-    const int block_count = (remaining_moves + block_size - 1) / block_size;
-    return std::min(helper_capacity, std::max(0, block_count - 1));
-}
 
 [[nodiscard]] bool use_root_aspiration(
     const SearchLimits& limits,
@@ -3176,242 +3009,6 @@ void reset_searcher_iteration(
 ) noexcept {
     (void)limits;
     return depth >= 2;
-}
-
-[[nodiscard]] OrderedRootSearch prepare_ordered_root_search(
-    Searcher& searcher,
-    const Position& root,
-    Move hint_move,
-    int depth
-) noexcept {
-    OrderedRootSearch prep;
-    prep.probe = memory::tt_probe(searcher.mem.tt, root.key);
-    const Move tt_move = searcher.tt_move_from_probe(prep.probe);
-    prep.root_hint = move_is_none(tt_move) ? hint_move : tt_move;
-    prep.checked = searcher.in_check(root);
-    prep.eval_info = searcher.resolve_static_eval(root, prep.probe, 0, prep.checked, false);
-
-    MoveList list{};
-    generate_legal(root, searcher.mem, list);
-
-    if (searcher.limits.root_move_count > 0) {
-        MoveList filtered{};
-        for (int i = 0; i < list.size; ++i) {
-            const Move move = list.moves[i];
-            bool allowed = false;
-            for (int j = 0; j < searcher.limits.root_move_count; ++j) {
-                if (searcher.limits.root_moves[j] == move) {
-                    allowed = true;
-                    break;
-                }
-            }
-            if (allowed)
-                filtered.moves[filtered.size++] = move;
-        }
-        list = filtered;
-    }
-
-    if (list.size == 0)
-        return prep;
-
-    ScoredMoveList scored;
-    searcher.score_moves(root, list, scored, prep.root_hint, 0, depth);
-    prep.ordered_moves.reserve(static_cast<std::size_t>(scored.size));
-    for (int i = 0; i < scored.size; ++i)
-        prep.ordered_moves.push_back(searcher.pick_next(scored, i));
-
-    return prep;
-}
-
-void search_root_blocks(Searcher& searcher, RootParallelTask& task) noexcept {
-    for (;;) {
-        if (task.cutoff.load(std::memory_order_relaxed) || searcher.hit_hard_limit())
-            break;
-
-        const int start =
-            task.next_index.fetch_add(task.block_size, std::memory_order_relaxed);
-        if (start >= static_cast<int>(task.ordered_moves->size()))
-            break;
-
-        const int end = std::min(
-            start + task.block_size,
-            static_cast<int>(task.ordered_moves->size())
-        );
-        int local_alpha = task.shared_alpha.load(std::memory_order_relaxed);
-
-        for (int i = start; i < end; ++i) {
-            if (task.cutoff.load(std::memory_order_relaxed) || searcher.hit_hard_limit())
-                break;
-
-            const Move move = (*task.ordered_moves)[i];
-            const Searcher::RootMoveResult outcome =
-                searcher.search_root_move(*task.root, move, task.depth, local_alpha, task.beta, false);
-            if (outcome.improved_alpha)
-                local_alpha = outcome.score;
-            task.submit(searcher, move, outcome);
-        }
-    }
-
-    searcher.publish_nodes();
-}
-
-[[nodiscard]] SearchResult finalize_parallel_root(
-    Searcher& searcher,
-    const OrderedRootSearch& prep,
-    RootParallelTask& task,
-    const Position& root,
-    u64 attempt_base_nodes
-) noexcept {
-    SearchResult result = task.best;
-    result.nodes = searcher.limits.shared_nodes != nullptr
-        ? searcher.limits.shared_nodes->load(std::memory_order_relaxed) - attempt_base_nodes
-        : searcher.nodes;
-    result.seldepth = task.max_seldepth;
-
-    searcher.seldepth = std::max(searcher.seldepth, task.max_seldepth);
-    searcher.pv_length[0] = task.best_pv_length;
-    for (int i = 0; i < task.best_pv_length; ++i)
-        searcher.pv_table[0][i] = task.best_pv[i];
-
-    if (!prep.checked &&
-        !Searcher::is_mate_window(result.score) &&
-        result.score > task.alpha0 &&
-        result.score < task.beta) {
-        searcher.update_correction_history(
-            static_cast<Color>(root.side_to_move),
-            prep.eval_info.keys,
-            prep.eval_info.base,
-            result.score,
-            task.depth
-        );
-    }
-
-    searcher.save_tt(
-        root,
-        task.depth,
-        0,
-        result.score,
-        prep.eval_info.raw,
-        result.best_move,
-        task.alpha0,
-        task.beta,
-        true
-    );
-    return result;
-}
-
-[[maybe_unused]] [[nodiscard]] SearchResult search_root_parallel(
-    Searcher& main_searcher,
-    RootThreadPool& pool,
-    const Position& root,
-    int depth,
-    Move hint_move,
-    int alpha,
-    int beta,
-    Searcher::clock::time_point search_start,
-    u64 attempt_base_nodes
-) {
-    const OrderedRootSearch prep =
-        prepare_ordered_root_search(main_searcher, root, hint_move, depth);
-
-    if (prep.ordered_moves.empty()) {
-        SearchResult result{};
-        result.depth = depth;
-        result.score = prep.checked ? -VALUE_MATE : 0;
-        result.seldepth = main_searcher.seldepth;
-        return result;
-    }
-
-    const int seed_count = std::min<int>(
-        static_cast<int>(prep.ordered_moves.size()),
-        choose_root_seed_count(prep.ordered_moves.size(), main_searcher.limits.thread_count)
-    );
-
-    RootParallelTask task;
-    task.root = &root;
-    task.ordered_moves = &prep.ordered_moves;
-    task.depth = depth;
-    task.alpha0 = alpha;
-    task.beta = beta;
-    task.block_size = choose_root_block_size(prep.ordered_moves.size(), main_searcher.limits.thread_count);
-    task.start_time = search_start;
-    task.best.depth = depth;
-
-    const int remaining_moves =
-        static_cast<int>(prep.ordered_moves.size()) - seed_count;
-    const int helper_count = choose_active_root_helpers(
-        remaining_moves,
-        task.block_size,
-        pool.helper_capacity()
-    );
-
-    int local_alpha = alpha;
-    task.shared_alpha.store(local_alpha, std::memory_order_relaxed);
-    task.next_index.store(seed_count, std::memory_order_relaxed);
-
-    if (helper_count > 0) {
-        pool.dispatch(
-            task,
-            task.start_time,
-            0,
-            main_searcher.limits.shared_nodes,
-            helper_count
-        );
-    }
-
-    for (int i = 0; i < seed_count; ++i) {
-        const Move move = prep.ordered_moves[static_cast<std::size_t>(i)];
-        const Searcher::RootMoveResult outcome =
-            main_searcher.search_root_move(root, move, depth, local_alpha, beta, i == 0);
-        if (i == 0 && (outcome.score <= alpha || outcome.score >= beta)) {
-            main_searcher.publish_nodes();
-            if (helper_count > 0) {
-                task.cutoff.store(true, std::memory_order_relaxed);
-                pool.wait();
-            }
-
-            SearchResult fail_result{};
-            fail_result.best_move = move;
-            fail_result.score = outcome.score;
-            fail_result.depth = depth;
-            fail_result.seldepth = main_searcher.seldepth;
-            fail_result.nodes = main_searcher.limits.shared_nodes != nullptr
-                ? main_searcher.limits.shared_nodes->load(std::memory_order_relaxed) - attempt_base_nodes
-                : main_searcher.nodes;
-            return fail_result;
-        }
-
-        if (outcome.improved_alpha) {
-            local_alpha = outcome.score;
-            task.shared_alpha.store(local_alpha, std::memory_order_relaxed);
-        }
-        task.submit(main_searcher, move, outcome);
-
-        if (outcome.score >= beta) {
-            main_searcher.publish_nodes();
-            if (helper_count > 0) {
-                task.cutoff.store(true, std::memory_order_relaxed);
-                pool.wait();
-            }
-            return finalize_parallel_root(main_searcher, prep, task, root, attempt_base_nodes);
-        }
-    }
-
-    if (main_searcher.stopped ||
-        seed_count >= static_cast<int>(prep.ordered_moves.size())) {
-        main_searcher.publish_nodes();
-        if (helper_count > 0) {
-            task.cutoff.store(true, std::memory_order_relaxed);
-            pool.wait();
-        }
-        return finalize_parallel_root(main_searcher, prep, task, root, attempt_base_nodes);
-    }
-
-    search_root_blocks(main_searcher, task);
-    if (helper_count > 0)
-        pool.wait();
-
-    return finalize_parallel_root(main_searcher, prep, task, root, attempt_base_nodes);
 }
 
 } // namespace
@@ -3440,259 +3037,264 @@ std::string move_to_uci(Move m) {
     return s;
 }
 
-[[nodiscard]] SearchResult iterative_deepening_single(
-    const Position& root,
-    memory::Memory& mem,
-    const SearchLimits& limits,
-    std::ostream* out
+// Extracted common iterative-deepening helpers shared by single and lazy-SMP paths.
+namespace {
+
+struct IterativeWorkerResult {
+    SearchResult best{};
+    Move pv[MAX_PLY]{};
+    int pv_length = 0;
+};
+
+void capture_completed_result(
+    IterativeWorkerResult& result,
+    const SearchResult& best,
+    const Searcher& searcher
+) noexcept {
+    result.best = best;
+    result.pv_length = searcher.pv_length[0];
+    for (int i = 0; i < result.pv_length; ++i)
+        result.pv[i] = searcher.pv_table[0][i];
+}
+
+void emit_iteration_info(
+    std::ostream& stream,
+    memory::Memory& local_mem,
+    const Position& local_root,
+    const Searcher& searcher,
+    const SearchResult& current,
+    const Move* pv,
+    int pv_length,
+    Searcher::clock::time_point search_start,
+    u64 nodes,
+    int depth
 ) {
-    struct IterativeWorkerResult {
-        SearchResult best{};
-        Move pv[MAX_PLY]{};
-        int pv_length = 0;
-    };
+    const double seconds =
+        std::chrono::duration<double>(Searcher::clock::now() - search_start).count();
+    const u64 nps = seconds > 0.0
+        ? static_cast<u64>(static_cast<double>(nodes) / seconds)
+        : 0ULL;
+    const u64 time_ms = static_cast<u64>(seconds * 1000.0);
+    const int hashfull = memory::tt_hashfull(local_mem.tt);
 
-    const auto capture_completed_result = [](
-        IterativeWorkerResult& result,
-        const SearchResult& best,
-        const Searcher& searcher
-    ) noexcept {
-        result.best = best;
-        result.pv_length = searcher.pv_length[0];
-        for (int i = 0; i < result.pv_length; ++i)
-            result.pv[i] = searcher.pv_table[0][i];
-    };
+    stream << "info depth " << depth
+           << " seldepth " << current.seldepth << ' ';
+    append_uci_score(stream, current.score, local_root, searcher.use_nnue());
+    stream << " nodes " << nodes
+           << " nps " << nps
+           << " hashfull " << hashfull
+           << " time " << time_ms
+           << " pv";
 
-    const auto emit_iteration_info = [](
-        std::ostream& stream,
-        memory::Memory& local_mem,
-        const Position& local_root,
-        const Searcher& searcher,
-        const SearchResult& current,
-        const Move* pv,
-        int pv_length,
-        Searcher::clock::time_point search_start,
-        u64 nodes,
-        int depth
-    ) {
-        const double seconds =
-            std::chrono::duration<double>(Searcher::clock::now() - search_start).count();
-        const u64 nps = seconds > 0.0
-            ? static_cast<u64>(static_cast<double>(nodes) / seconds)
-            : 0ULL;
-        const u64 time_ms = static_cast<u64>(seconds * 1000.0);
-        const int hashfull = memory::tt_hashfull(local_mem.tt);
+    for (int i = 0; i < pv_length; ++i)
+        stream << ' ' << move_to_uci(pv[i]);
 
-        stream << "info depth " << depth
-               << " seldepth " << current.seldepth << ' ';
-        append_uci_score(stream, current.score, local_root, searcher.use_nnue());
-        stream << " nodes " << nodes
-               << " nps " << nps
-               << " hashfull " << hashfull
-               << " time " << time_ms
-               << " pv";
+    stream << '\n';
+}
 
-        for (int i = 0; i < pv_length; ++i)
-            stream << ' ' << move_to_uci(pv[i]);
-
-        stream << '\n';
-    };
-
-    const auto iterative_deepening_worker = [&](
-        Searcher& searcher,
-        const Position& local_root,
-        std::ostream* local_out
-    ) -> IterativeWorkerResult {
-        IterativeWorkerResult result{};
-        SearchResult best{};
-        Move hint_move = 0;
-        Position keyed_root = local_root;
-        position_refresh_key(keyed_root, searcher.mem.tables);
-        searcher.root_side_to_move = keyed_root.side_to_move;
-        const auto search_start = Searcher::clock::now();
-        searcher.start_time = search_start;
-        u64 total_nodes = 0;
-#if VALERAIN_SEARCHSTATS_OBS
-        u64 last_reported_nodes = 0;
+[[nodiscard]] IterativeWorkerResult iterative_deepening_worker(
+    Searcher& searcher,
+    const Position& local_root,
+    std::ostream* local_out
+) {
+    IterativeWorkerResult result{};
+    SearchResult best{};
+    Move hint_move = 0;
+    Position keyed_root = local_root;
+    position_refresh_key(keyed_root, searcher.mem.tables);
+    searcher.root_side_to_move = keyed_root.side_to_move;
+    const auto search_start = Searcher::clock::now();
+    searcher.start_time = search_start;
+    u64 total_nodes = 0;
+#if MAGNUS_SEARCHSTATS_OBS
+    u64 last_reported_nodes = 0;
 #endif
-        const int max_depth = std::max(1, searcher.limits.depth);
-        IterationTimeState time_state{};
-        if (searcher.limits.root_move_count > 0) {
-            time_state.root_legal_count = searcher.limits.root_move_count;
-        } else {
-            MoveList root_moves{};
-            generate_legal(keyed_root, searcher.mem, root_moves);
-            time_state.root_legal_count = root_moves.size;
+    const int max_depth = std::max(1, searcher.limits.depth);
+    IterationTimeState time_state{};
+    if (searcher.limits.root_move_count > 0) {
+        time_state.root_legal_count = searcher.limits.root_move_count;
+    } else {
+        MoveList root_moves{};
+        generate_legal(keyed_root, searcher.mem, root_moves);
+        time_state.root_legal_count = root_moves.size;
+    }
+
+    for (int depth = 1; depth <= max_depth; ++depth) {
+        SearchResult current{};
+        u64 depth_nodes = 0;
+#if MAGNUS_SEARCHSTATS_OBS
+        int aspiration_fail_low = 0;
+        int aspiration_fail_high = 0;
+        const Searcher::SearchStats stats_before = searcher.stats;
+#endif
+
+        int alpha = -VALUE_INF;
+        int beta = VALUE_INF;
+        int delta = ASPIRATION_DELTA;
+        int depth_max_seldepth = 0;
+
+        if (use_root_aspiration(searcher.limits, depth)) {
+            alpha = std::max(-VALUE_INF, best.score - delta);
+            beta = std::min(VALUE_INF, best.score + delta);
         }
 
-        for (int depth = 1; depth <= max_depth; ++depth) {
-            SearchResult current{};
-            u64 depth_nodes = 0;
-#if VALERAIN_SEARCHSTATS_OBS
-            int aspiration_fail_low = 0;
-            int aspiration_fail_high = 0;
-            const Searcher::SearchStats stats_before = searcher.stats;
-#endif
-
-            int alpha = -VALUE_INF;
-            int beta = VALUE_INF;
-            int delta = ASPIRATION_DELTA;
-            int depth_max_seldepth = 0;
-
-            if (use_root_aspiration(searcher.limits, depth)) {
-                alpha = std::max(-VALUE_INF, best.score - delta);
-                beta = std::min(VALUE_INF, best.score + delta);
-            }
-
-            while (true) {
-                if (searcher.stopped)
-                    break;
-
-                reset_searcher_iteration(searcher, search_start, total_nodes + depth_nodes);
-
-                current = searcher.search_root(keyed_root, depth, hint_move, alpha, beta);
-                depth_max_seldepth = std::max(depth_max_seldepth, searcher.seldepth);
-                current.seldepth = depth_max_seldepth;
-                depth_nodes += current.nodes;
-
-                if (searcher.stopped || depth == 1)
-                    break;
-
-                if (current.score <= alpha) {
-#if VALERAIN_SEARCHSTATS_OBS
-                    ++aspiration_fail_low;
-#endif
-                    alpha = std::max(-VALUE_INF, current.score - delta);
-                    beta = std::min(VALUE_INF, current.score + delta);
-                    delta *= 2;
-                    continue;
-                }
-
-                if (current.score >= beta) {
-#if VALERAIN_SEARCHSTATS_OBS
-                    ++aspiration_fail_high;
-#endif
-                    alpha = std::max(-VALUE_INF, current.score - delta);
-                    beta = std::min(VALUE_INF, current.score + delta);
-                    delta *= 2;
-                    continue;
-                }
-
+        while (true) {
+            if (searcher.stopped)
                 break;
+
+            reset_searcher_iteration(searcher, search_start, total_nodes + depth_nodes);
+
+            current = searcher.search_root(keyed_root, depth, hint_move, alpha, beta);
+            depth_max_seldepth = std::max(depth_max_seldepth, searcher.seldepth);
+            current.seldepth = depth_max_seldepth;
+            searcher.publish_nodes();
+            depth_nodes += current.nodes;
+
+            if (searcher.stopped || depth == 1)
+                break;
+
+            if (current.score <= alpha) {
+#if MAGNUS_SEARCHSTATS_OBS
+                ++aspiration_fail_low;
+#endif
+                alpha = std::max(-VALUE_INF, current.score - delta);
+                beta = std::min(VALUE_INF, current.score + delta);
+                delta *= 2;
+                continue;
             }
 
-            total_nodes += depth_nodes;
-            const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
-
-            if (!searcher.stopped || best.depth == 0) {
-                best = current;
-                best.nodes = total_nodes;
-                hint_move = current.best_move;
-                capture_completed_result(result, best, searcher);
+            if (current.score >= beta) {
+#if MAGNUS_SEARCHSTATS_OBS
+                ++aspiration_fail_high;
+#endif
+                alpha = std::max(-VALUE_INF, current.score - delta);
+                beta = std::min(VALUE_INF, current.score + delta);
+                delta *= 2;
+                continue;
             }
 
-            const bool should_stop_for_time =
-                !stopped_mid_depth &&
-                should_stop_after_iteration(searcher, time_state, best, depth);
+            break;
+        }
 
-            if (local_out != nullptr &&
-                searcher.limits.report_info &&
-                !stopped_mid_depth) {
+        total_nodes += depth_nodes;
+        const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
+
+        if (!searcher.stopped || best.depth == 0) {
+            best = current;
+            best.nodes = total_nodes;
+            hint_move = current.best_move;
+            capture_completed_result(result, best, searcher);
+        }
+
+        const bool should_stop_for_time =
+            !stopped_mid_depth &&
+            should_stop_after_iteration(searcher, time_state, best, depth);
+
+        if (local_out != nullptr &&
+            searcher.limits.report_info &&
+            !stopped_mid_depth) {
+            const u64 reported_nodes = searcher.limits.shared_nodes != nullptr
+                ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
+                : total_nodes;
+#if MAGNUS_SEARCHSTATS_OBS
+            const u64 reported_depth_nodes =
+                reported_nodes >= last_reported_nodes
+                    ? reported_nodes - last_reported_nodes
+                    : depth_nodes;
+            last_reported_nodes = reported_nodes;
+#endif
+            emit_iteration_info(
+                *local_out,
+                searcher.mem,
+                keyed_root,
+                searcher,
+                current,
+                searcher.pv_table[0],
+                searcher.pv_length[0],
+                search_start,
+                reported_nodes,
+                depth
+            );
+#if MAGNUS_SEARCHSTATS_OBS
+            emit_searchstats_line(
+                *local_out,
+                depth,
+                false,
+                reported_depth_nodes,
+                aspiration_fail_low,
+                aspiration_fail_high,
+                stats_before,
+                searcher.stats
+            );
+#endif
+        }
+
+        if (stopped_mid_depth) {
+#if MAGNUS_SEARCHSTATS_OBS
+            if (local_out != nullptr && searcher.limits.report_info) {
                 const u64 reported_nodes = searcher.limits.shared_nodes != nullptr
                     ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
                     : total_nodes;
-#if VALERAIN_SEARCHSTATS_OBS
                 const u64 reported_depth_nodes =
                     reported_nodes >= last_reported_nodes
                         ? reported_nodes - last_reported_nodes
                         : depth_nodes;
-                last_reported_nodes = reported_nodes;
-#endif
-                emit_iteration_info(
-                    *local_out,
-                    searcher.mem,
-                    local_root,
-                    searcher,
-                    current,
-                    searcher.pv_table[0],
-                    searcher.pv_length[0],
-                    search_start,
-                    reported_nodes,
-                    depth
-                );
-#if VALERAIN_SEARCHSTATS_OBS
                 emit_searchstats_line(
                     *local_out,
                     depth,
-                    false,
+                    true,
                     reported_depth_nodes,
                     aspiration_fail_low,
                     aspiration_fail_high,
                     stats_before,
                     searcher.stats
                 );
-#endif
             }
-
-            if (stopped_mid_depth) {
-#if VALERAIN_SEARCHSTATS_OBS
-                if (local_out != nullptr && searcher.limits.report_info) {
-                    const u64 reported_nodes = searcher.limits.shared_nodes != nullptr
-                        ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
-                        : total_nodes;
-                    const u64 reported_depth_nodes =
-                        reported_nodes >= last_reported_nodes
-                            ? reported_nodes - last_reported_nodes
-                            : depth_nodes;
-                    emit_searchstats_line(
-                        *local_out,
-                        depth,
-                        true,
-                        reported_depth_nodes,
-                        aspiration_fail_low,
-                        aspiration_fail_high,
-                        stats_before,
-                        searcher.stats
-                    );
-                }
 #endif
-                break;
-            }
-
-            if (should_stop_for_time)
-                break;
-
-            if (searcher.stop_after_completed_depth())
-                break;
+            break;
         }
 
-        result.best.nodes = searcher.limits.shared_nodes != nullptr
-            ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
-            : total_nodes;
+        if (should_stop_for_time)
+            break;
 
-#if VALERAIN_CAPTURE_OBS
-        if (local_out != nullptr && searcher.limits.report_info)
-            searcher.emit_capture_observation(*local_out);
+        if (searcher.stop_after_completed_depth())
+            break;
+    }
+
+    searcher.publish_nodes();
+    result.best.nodes = searcher.limits.shared_nodes != nullptr
+        ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
+        : total_nodes;
+
+#if MAGNUS_CAPTURE_OBS
+    if (local_out != nullptr && searcher.limits.report_info)
+        searcher.emit_capture_observation(*local_out);
 #endif
-#if VALERAIN_MOVEPICKER_OBS
-        if (local_out != nullptr && searcher.limits.report_info)
-            searcher.emit_movepicker_observation(*local_out);
+#if MAGNUS_MOVEPICKER_OBS
+    if (local_out != nullptr && searcher.limits.report_info)
+        searcher.emit_movepicker_observation(*local_out);
 #endif
-#if VALERAIN_SEARCH_OBS
-        if (local_out != nullptr && searcher.limits.report_info)
-            searcher.emit_search_observation(*local_out);
+#if MAGNUS_SEARCH_OBS
+    if (local_out != nullptr && searcher.limits.report_info)
+        searcher.emit_search_observation(*local_out);
 #endif
 
-        return result;
-    };
+    return result;
+}
 
+} // namespace
+
+[[nodiscard]] SearchResult iterative_deepening_single(
+    const Position& root,
+    memory::Memory& mem,
+    const SearchLimits& limits,
+    std::ostream* out
+) {
     memory::memory_new_search(mem);
 
     SearchLimits local_limits = limits;
     Searcher searcher(mem, local_limits);
-    const IterativeWorkerResult result =
-        iterative_deepening_worker(searcher, root, out);
-    return result.best;
+    return iterative_deepening_worker(searcher, root, out).best;
 }
 
 [[nodiscard]] SearchResult iterative_deepening_lazy_smp(
@@ -3702,248 +3304,6 @@ std::string move_to_uci(Move m) {
     std::ostream* out
 ) {
     memory::memory_new_search(mem);
-
-    struct IterativeWorkerResult {
-        SearchResult best{};
-        Move pv[MAX_PLY]{};
-        int pv_length = 0;
-    };
-
-    const auto capture_completed_result = [](
-        IterativeWorkerResult& result,
-        const SearchResult& best,
-        const Searcher& searcher
-    ) noexcept {
-        result.best = best;
-        result.pv_length = searcher.pv_length[0];
-        for (int i = 0; i < result.pv_length; ++i)
-            result.pv[i] = searcher.pv_table[0][i];
-    };
-
-    const auto emit_iteration_info = [](
-        std::ostream& stream,
-        memory::Memory& local_mem,
-        const Position& local_root,
-        const Searcher& searcher,
-        const SearchResult& current,
-        const Move* pv,
-        int pv_length,
-        Searcher::clock::time_point search_start,
-        u64 nodes,
-        int depth
-    ) {
-        const double seconds =
-            std::chrono::duration<double>(Searcher::clock::now() - search_start).count();
-        const u64 nps = seconds > 0.0
-            ? static_cast<u64>(static_cast<double>(nodes) / seconds)
-            : 0ULL;
-        const u64 time_ms = static_cast<u64>(seconds * 1000.0);
-        const int hashfull = memory::tt_hashfull(local_mem.tt);
-
-        stream << "info depth " << depth
-               << " seldepth " << current.seldepth << ' ';
-        append_uci_score(stream, current.score, local_root, searcher.use_nnue());
-        stream << " nodes " << nodes
-               << " nps " << nps
-               << " hashfull " << hashfull
-               << " time " << time_ms
-               << " pv";
-
-        for (int i = 0; i < pv_length; ++i)
-            stream << ' ' << move_to_uci(pv[i]);
-
-        stream << '\n';
-    };
-
-    const auto iterative_deepening_worker = [&](
-        Searcher& searcher,
-        const Position& local_root,
-        std::ostream* local_out
-    ) -> IterativeWorkerResult {
-        IterativeWorkerResult result{};
-        SearchResult best{};
-        Move hint_move = 0;
-        Position keyed_root = local_root;
-        position_refresh_key(keyed_root, searcher.mem.tables);
-        searcher.root_side_to_move = keyed_root.side_to_move;
-        const auto search_start = Searcher::clock::now();
-        searcher.start_time = search_start;
-        u64 total_nodes = 0;
-#if VALERAIN_SEARCHSTATS_OBS
-        u64 last_reported_nodes = 0;
-#endif
-        const int max_depth = std::max(1, searcher.limits.depth);
-        IterationTimeState time_state{};
-        if (searcher.limits.root_move_count > 0) {
-            time_state.root_legal_count = searcher.limits.root_move_count;
-        } else {
-            MoveList root_moves{};
-            generate_legal(keyed_root, searcher.mem, root_moves);
-            time_state.root_legal_count = root_moves.size;
-        }
-
-        for (int depth = 1; depth <= max_depth; ++depth) {
-            SearchResult current{};
-            u64 depth_nodes = 0;
-#if VALERAIN_SEARCHSTATS_OBS
-            int aspiration_fail_low = 0;
-            int aspiration_fail_high = 0;
-            const Searcher::SearchStats stats_before = searcher.stats;
-#endif
-
-            int alpha = -VALUE_INF;
-            int beta = VALUE_INF;
-            int delta = ASPIRATION_DELTA;
-            int depth_max_seldepth = 0;
-
-            if (use_root_aspiration(searcher.limits, depth)) {
-                alpha = std::max(-VALUE_INF, best.score - delta);
-                beta = std::min(VALUE_INF, best.score + delta);
-            }
-
-            while (true) {
-                if (searcher.stopped)
-                    break;
-
-                reset_searcher_iteration(searcher, search_start, total_nodes + depth_nodes);
-
-                current = searcher.search_root(keyed_root, depth, hint_move, alpha, beta);
-                depth_max_seldepth = std::max(depth_max_seldepth, searcher.seldepth);
-                current.seldepth = depth_max_seldepth;
-                searcher.publish_nodes();
-                depth_nodes += current.nodes;
-
-                if (searcher.stopped || depth == 1)
-                    break;
-
-                if (current.score <= alpha) {
-#if VALERAIN_SEARCHSTATS_OBS
-                    ++aspiration_fail_low;
-#endif
-                    alpha = std::max(-VALUE_INF, current.score - delta);
-                    beta = std::min(VALUE_INF, current.score + delta);
-                    delta *= 2;
-                    continue;
-                }
-
-                if (current.score >= beta) {
-#if VALERAIN_SEARCHSTATS_OBS
-                    ++aspiration_fail_high;
-#endif
-                    alpha = std::max(-VALUE_INF, current.score - delta);
-                    beta = std::min(VALUE_INF, current.score + delta);
-                    delta *= 2;
-                    continue;
-                }
-
-                break;
-            }
-
-            total_nodes += depth_nodes;
-            const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
-
-            if (!searcher.stopped || best.depth == 0) {
-                best = current;
-                best.nodes = total_nodes;
-                hint_move = current.best_move;
-                capture_completed_result(result, best, searcher);
-            }
-
-            const bool should_stop_for_time =
-                !stopped_mid_depth &&
-                should_stop_after_iteration(searcher, time_state, best, depth);
-
-            if (local_out != nullptr &&
-                searcher.limits.report_info &&
-                !stopped_mid_depth) {
-                const u64 reported_nodes = searcher.limits.shared_nodes != nullptr
-                    ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
-                    : total_nodes;
-#if VALERAIN_SEARCHSTATS_OBS
-                const u64 reported_depth_nodes =
-                    reported_nodes >= last_reported_nodes
-                        ? reported_nodes - last_reported_nodes
-                        : depth_nodes;
-                last_reported_nodes = reported_nodes;
-#endif
-                emit_iteration_info(
-                    *local_out,
-                    searcher.mem,
-                    local_root,
-                    searcher,
-                    current,
-                    searcher.pv_table[0],
-                    searcher.pv_length[0],
-                    search_start,
-                    reported_nodes,
-                    depth
-                );
-#if VALERAIN_SEARCHSTATS_OBS
-                emit_searchstats_line(
-                    *local_out,
-                    depth,
-                    false,
-                    reported_depth_nodes,
-                    aspiration_fail_low,
-                    aspiration_fail_high,
-                    stats_before,
-                    searcher.stats
-                );
-#endif
-            }
-
-            if (stopped_mid_depth) {
-#if VALERAIN_SEARCHSTATS_OBS
-                if (local_out != nullptr && searcher.limits.report_info) {
-                    const u64 reported_nodes = searcher.limits.shared_nodes != nullptr
-                        ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
-                        : total_nodes;
-                    const u64 reported_depth_nodes =
-                        reported_nodes >= last_reported_nodes
-                            ? reported_nodes - last_reported_nodes
-                            : depth_nodes;
-                    emit_searchstats_line(
-                        *local_out,
-                        depth,
-                        true,
-                        reported_depth_nodes,
-                        aspiration_fail_low,
-                        aspiration_fail_high,
-                        stats_before,
-                        searcher.stats
-                    );
-                }
-#endif
-                break;
-            }
-
-            if (should_stop_for_time)
-                break;
-
-            if (searcher.stop_after_completed_depth())
-                break;
-        }
-
-        searcher.publish_nodes();
-        result.best.nodes = searcher.limits.shared_nodes != nullptr
-            ? searcher.limits.shared_nodes->load(std::memory_order_relaxed)
-            : total_nodes;
-
-#if VALERAIN_CAPTURE_OBS
-        if (local_out != nullptr && searcher.limits.report_info)
-            searcher.emit_capture_observation(*local_out);
-#endif
-#if VALERAIN_MOVEPICKER_OBS
-        if (local_out != nullptr && searcher.limits.report_info)
-            searcher.emit_movepicker_observation(*local_out);
-#endif
-#if VALERAIN_SEARCH_OBS
-        if (local_out != nullptr && searcher.limits.report_info)
-            searcher.emit_search_observation(*local_out);
-#endif
-
-        return result;
-    };
 
     const auto select_lazy_smp_best_index = [](
         const std::vector<IterativeWorkerResult>& results
@@ -4133,4 +3493,4 @@ SearchResult iterative_deepening(
     return iterative_deepening_lazy_smp(root, mem, limits, out);
 }
 
-} // namespace valerain::search
+} // namespace magnus::search

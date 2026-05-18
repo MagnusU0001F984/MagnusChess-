@@ -31,11 +31,11 @@ SOFTWARE.
 #if (defined(__x86_64__) || defined(_M_X64) || defined(__i386) || defined(_M_IX86)) \
  && (defined(__GNUC__) || defined(__clang__))
     #include <immintrin.h>
-    #define VALERAIN_CAN_COMPILE_PEXT 1
-    #define VALERAIN_TARGET_BMI2 __attribute__((target("bmi2")))
+    #define MAGNUS_CAN_COMPILE_PEXT 1
+    #define MAGNUS_TARGET_BMI2 __attribute__((target("bmi2")))
 #else
-    #define VALERAIN_CAN_COMPILE_PEXT 0
-    #define VALERAIN_TARGET_BMI2
+    #define MAGNUS_CAN_COMPILE_PEXT 0
+    #define MAGNUS_TARGET_BMI2
 #endif
 
 /*
@@ -43,7 +43,12 @@ This file implements the slider attack backends. It can fall back to classical
 ray scans, use dense lookup tables, or exploit BMI2/PEXT when available.
 */
 
-namespace valerain {
+/* ===== 繁體中文註釋 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 實作詳情請參閱對應的 .h 標頭檔案。
+ */
+
+namespace magnus {
 
 namespace {
 
@@ -201,20 +206,20 @@ inline std::uint32_t dense_index_from_occupied(
     return index;
 }
 
-#if VALERAIN_CAN_COMPILE_PEXT
-VALERAIN_TARGET_BMI2 bool query_cpu_bmi2_support() noexcept {
+#if MAGNUS_CAN_COMPILE_PEXT
+MAGNUS_TARGET_BMI2 bool query_cpu_bmi2_support() noexcept {
     __builtin_cpu_init();
     return __builtin_cpu_supports("bmi2");
 }
 
-VALERAIN_TARGET_BMI2 std::uint32_t pext_index_from_occupied(
+MAGNUS_TARGET_BMI2 std::uint32_t pext_index_from_occupied(
     AttackBitboard occupied,
     AttackBitboard mask
 ) noexcept {
     return static_cast<std::uint32_t>(_pext_u64(occupied, mask));
 }
 
-VALERAIN_TARGET_BMI2 AttackBitboard bishop_attacks_pext(
+MAGNUS_TARGET_BMI2 AttackBitboard bishop_attacks_pext(
     const memory::Memory& mem,
     int sq,
     AttackBitboard occupied
@@ -224,7 +229,7 @@ VALERAIN_TARGET_BMI2 AttackBitboard bishop_attacks_pext(
     return g_bishop_table[e.offset + pext_index_from_occupied(occupied, e.mask)];
 }
 
-VALERAIN_TARGET_BMI2 AttackBitboard rook_attacks_pext(
+MAGNUS_TARGET_BMI2 AttackBitboard rook_attacks_pext(
     const memory::Memory& mem,
     int sq,
     AttackBitboard occupied
@@ -239,6 +244,13 @@ bool query_cpu_bmi2_support() noexcept {
 }
 #endif
 
+/*
+ * 攻擊生成實作
+ * init_slider_tables() — 構建稠密索引滑子攻擊表（主教+城堡）
+ * set_occupancy_from_index() — 從索引還原佔位位元棋盤
+ * dense_index_from_occupied() — 從佔位計算稠密索引（PEXT 或乘法雜湊）
+ * attack_auto_select_backend() — 自動選擇最快可用的攻擊後端
+ */
 void init_slider_table(
     std::array<SliderAttackEntry, 64>& entries,
     std::vector<AttackBitboard>& table,
@@ -332,7 +344,7 @@ void attack_set_backend(AttackBackendKind kind) noexcept {
     switch (kind) {
         case AttackBackendKind::PEXT:
             init_slider_tables();
-#if VALERAIN_CAN_COMPILE_PEXT
+#if MAGNUS_CAN_COMPILE_PEXT
             if (pext_supported_runtime()) {
                 g_attack_backend.bishop = &bishop_attacks_pext;
                 g_attack_backend.rook   = &rook_attacks_pext;
@@ -479,4 +491,4 @@ bool aligned(int a, int b) noexcept {
     return same_file(a, b) || same_rank(a, b) || same_diagonal(a, b);
 }
 
-} // namespace valerain
+} // namespace magnus

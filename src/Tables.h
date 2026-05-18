@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <array>
@@ -29,7 +35,7 @@ SOFTWARE.
 
 #include "Types.h"
 
-namespace valerain {
+namespace magnus {
 
 /*
 This file owns the static lookup tables that are expensive to rebuild during
@@ -45,6 +51,13 @@ struct ZobristTables {
     Key side = 0;
 };
 
+/*
+ * Tables — 靜態查表集合（一次性初始化，搜尋期間唯讀）
+ * 包含：國王/騎士/兵攻擊遮罩、between/line 幾何遮罩、
+ * Chebyshev/Manhattan 距離表、Zobrist 雜湊鍵表
+ * 輔助函數：splitmix64(PRNG)、mix64(最終化)、king_attack_mask、knight_attack_mask
+ * 所有表在程式啟動時通過 tables_init() 一次性構建
+ */
 struct Tables {
     // Leaper attack masks and board geometry helpers.
     Bitboard king_attacks[SQ_NB]{};
@@ -242,4 +255,4 @@ inline void tables_init(Tables& t, u64 zobrist_seed = 0xC0FFEE1234567890ULL) noe
     t.initialized = true;
 }
 
-} // namespace valerain
+} // namespace magnus

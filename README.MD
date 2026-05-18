@@ -1,6 +1,6 @@
-# Valerain
+# Magnus
 
-Valerain is a C++20 chess engine with UCI support, a classical search core, optional NNUE evaluation, and built-in bench/perft/divide tooling for validation and performance checks.
+Magnus is a C++20 chess engine with UCI support, a classical search core, optional NNUE evaluation, and built-in bench/perft/divide tooling for validation and performance checks.
 
 ## Technical Overview
 
@@ -95,7 +95,7 @@ mingw32-make -j
 ```
 
 Output:
-- `src/bin/valerain.exe`
+- `src/bin/magnus.exe`
 
 ### Linux / WSL / MSYS2
 ```bash
@@ -105,7 +105,7 @@ make -j
 ```
 
 Output:
-- `src/bin/valerain`
+- `src/bin/magnus`
 
 ### Optional PGO Flow
 1. Build an instrumented binary:
@@ -115,7 +115,7 @@ make pgo-generate
 ```
 2. Run representative workloads to generate profile data:
 ```bash
-./bin/valerain_pgo search 20 64
+./bin/magnus_pgo search 20 64
 ```
 3. Rebuild with profile use:
 ```bash
@@ -129,20 +129,20 @@ make pgo-use
 ### UCI Mode
 ```bash
 # No arguments starts UCI mode
-./src/bin/valerain
+./src/bin/magnus
 
 # Equivalent explicit form
-./src/bin/valerain uci
+./src/bin/magnus uci
 ```
 
 ### Bench / Perft / Divide / Fixed-Depth Search
 ```bash
 # perft: <depth> <hash_mb> <threads>
-./src/bin/valerain 6 64 1
+./src/bin/magnus 6 64 1
 
 # divide: divide <depth> <hash_mb> <threads> [live]
-./src/bin/valerain divide 6 64 1
+./src/bin/magnus divide 6 64 1
 
 # search: search <depth> <hash_mb>
-./src/bin/valerain search 8 64
+./src/bin/magnus search 8 64
 ```

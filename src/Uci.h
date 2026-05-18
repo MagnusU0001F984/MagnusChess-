@@ -24,12 +24,29 @@ SOFTWARE.
 
 #pragma once
 
-namespace valerain {
+/*
+ * UCI 前端 — MagnusChess 的通用西洋棋介面 (Universal Chess Interface)
+ *
+ * 本模組實作完整的 UCI 協定前端，負責：
+ *   1. UCI 命令解析（go / position / setoption / stop / ponderhit / quit / uci / isready / ucinewgame）
+ *   2. FEN 字串解析與局面建構（startpos / fen + moves）
+ *   3. NNUE 網路檔案的載入與管理
+ *   4. 搜尋線程的生命週期管理（啟動 / 停止 / 沉思 / ponderhit）
+ *   5. UCI info 字串輸出（深度、分數、PV、節點數、nps、hashfull）
+ *   6. 基於最近搜尋結果的沉思著法 (ponder move) 提取
+ *
+ * 唯一的公開入口點是 run_uci()，啟動標準輸入/輸出 UCI 迴圈。
+ */
+namespace magnus {
 
 /*
-Minimal UCI front-end for the engine. It owns command parsing, option handling,
-position setup, and dispatch into the synchronous search loop.
-*/
+ * run_uci — UCI 命令迴圈入口點
+ *
+ * 初始化 UciSession（記憶體、局面、NNUE），輸出橫幅和 UCI ID，
+ * 然後進入阻塞的 stdin 命令迴圈。接收到 "quit" 命令時回傳。
+ *
+ * 回傳值：0 表示正常退出
+ */
 int run_uci();
 
-} // namespace valerain
+} // namespace magnus

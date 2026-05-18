@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <cstddef>
@@ -32,7 +38,7 @@ SOFTWARE.
 #include "Perft.h"
 #include "Position.h"
 
-namespace valerain {
+namespace magnus {
 
 /*
 Bench mode is the command-line utility layer used for quick perft checks and
@@ -41,6 +47,12 @@ fixed-depth search/bench benchmarks outside of UCI.
 
 inline constexpr int DEFAULT_BENCH_MOVETIME_MS = 1000;
 
+/*
+ * Bench 模組公開介面
+ * BenchConfig — 命令列參數（perft_depth/search_depth/movetime/threads）
+ * PerftBenchResult — 基準測試計時結果
+ * set_start_position() — 建立標準西洋棋初始局面
+ */
 struct BenchConfig {
     int perft_depth = 10;
     int search_depth = 6;
@@ -92,4 +104,4 @@ void set_start_position(Position& pos) noexcept;
 [[nodiscard]] BenchConfig parse_config(int argc, char** argv) noexcept;
 int run_bench(int argc, char** argv);
 
-} // namespace valerain
+} // namespace magnus

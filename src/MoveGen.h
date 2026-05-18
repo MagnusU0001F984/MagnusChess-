@@ -22,13 +22,19 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include "Types.h"
 #include "Memory.h"
 #include "Position.h"
 
-namespace valerain {
+namespace magnus {
 
 /*
 Move generation combines bitboards, attack tables, pin masks, and a final
@@ -73,6 +79,12 @@ enum MoveFlag : u16 {
     MOVE_CAP_PROMO_Q  = 15
 };
 
+/* 著法列表結構體 — MoveList：用於 Perft 和搜尋的純著法容器
+ * ScoredMove：含評分欄位，用於著法排序（qsearch/root/probcut）
+ * ScoredMoveList：評分著法列表，含 see_value 快取
+ * GenInfo：著法生成上下文（將軍狀態、釘子、攻擊遮罩等）
+ * 著法編碼：16 位元 [to:6|from:6|flag:4]，flag 區分安靜/捕獲/升變/易位/過路兵
+ */
 struct MoveList {
     // Plain move container used by perft and search.
     Move moves[MAX_MOVES];
@@ -82,6 +94,7 @@ struct MoveList {
 struct ScoredMove {
     Move move = 0;
     i32 score = 0;
+    i32 see_value = 0;
 };
 
 struct ScoredMoveList {
@@ -172,7 +185,7 @@ constexpr PieceType promo_piece(Move m) noexcept {
         case MOVE_CAP_PROMO_R: return ROOK;
         case MOVE_PROMO_Q:
         case MOVE_CAP_PROMO_Q: return QUEEN;
-        default: return PIECE_TYPE_NONE;
+        default: return QUEEN;
     }
 }
 
@@ -455,4 +468,4 @@ inline void generate(
     list.size = static_cast<int>(end - list.moves);
 }
 
-} // namespace valerain
+} // namespace magnus

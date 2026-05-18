@@ -3,7 +3,7 @@
 ## 中文
 
 ### 概述
-`MoveGen.cpp` 是 ValerainChess 引擎中最大的单一源文件之一（约 49KB），实现了完整的国际象棋走法生成系统。它支持多种生成模式、走法合法性验证、将军检测和特殊走法处理。
+`MoveGen.cpp` 是 MagnusChess 引擎中最大的单一源文件之一（约 49KB），实现了完整的国际象棋走法生成系统。它支持多种生成模式、走法合法性验证、将军检测和特殊走法处理。
 
 ### 核心架构
 
@@ -81,7 +81,7 @@
 ## English
 
 ### Overview
-`MoveGen.cpp` is one of the largest single source files in the ValerainChess engine (~49KB), implementing a complete chess move generation system. It supports multiple generation modes, move legality validation, check detection, and special move handling.
+`MoveGen.cpp` is one of the largest single source files in the MagnusChess engine (~49KB), implementing a complete chess move generation system. It supports multiple generation modes, move legality validation, check detection, and special move handling.
 
 ### Core Architecture
 

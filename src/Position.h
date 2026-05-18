@@ -22,6 +22,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 */
 
+/* ===== ANNOTATED: 繁體中文註釋已添加 =====
+ * 本檔案是 MagnusChess 西洋棋引擎的一部分。
+ * 詳細說明請參閱對應的 .cpp 實作檔案。
+ */
+
+
 #pragma once
 
 #include <array>
@@ -29,7 +35,7 @@ SOFTWARE.
 #include "NnueLayout.h"
 #include "Types.h"
 
-namespace valerain {
+namespace magnus {
 
 struct Tables;
 
@@ -38,6 +44,13 @@ Position is the engine's canonical board state. It keeps mailbox access for
 simple piece lookup, bitboards for fast move generation, incremental eval
 totals, and an incremental Zobrist key for search and TT use.
 */
+/*
+ * Position — 引擎的標準棋盤狀態
+ * 維護信箱 (mailbox) 用於簡單棋子查詢、位元棋盤用於快速著法生成、
+ * 增量評估快取、增量 Zobrist 鍵值供搜尋和 TT 使用。
+ * NNUE 累加器儲存在 Position 中（每個視角一個），支援增量更新。
+ * StateInfo 記錄一步棋的狀態變化，供 unmake_move 恢復。
+ */
 struct Position {
     int side_to_move = WHITE;
     Square ep_sq = NO_SQ;
@@ -195,4 +208,4 @@ void unmake_move(
 void do_move_copy(Position& pos, Move m) noexcept;
 void do_move_copy(Position& pos, Move m, const Tables& tables) noexcept;
 
-} // namespace valerain
+} // namespace magnus
