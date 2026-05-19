@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"E:/mingw64/bin/mingw32-make\" -j)"
+    ]
+  }
+}

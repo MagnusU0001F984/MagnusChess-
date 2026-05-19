@@ -28,6 +28,7 @@ SOFTWARE.
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -262,10 +263,10 @@ inline void apply_feature_delta_avx2(
 ) noexcept {
     i16* acc_ptr = acc.data();
     for (int i = 0; i < kHidden; i += 16) {
-        __m256i acc_vec =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc_ptr + i));
-        const __m256i weight_vec =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(weights + i));
+        __m256i acc_vec;
+        std::memcpy(&acc_vec, acc_ptr + i, sizeof(__m256i));
+        __m256i weight_vec;
+        std::memcpy(&weight_vec, weights + i, sizeof(__m256i));
 
         if (add) {
             acc_vec = _mm256_add_epi16(acc_vec, weight_vec);
@@ -273,7 +274,7 @@ inline void apply_feature_delta_avx2(
             acc_vec = _mm256_sub_epi16(acc_vec, weight_vec);
         }
 
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc_ptr + i), acc_vec);
+        std::memcpy(acc_ptr + i, &acc_vec, sizeof(__m256i));
     }
 }
 
@@ -284,16 +285,16 @@ inline void apply_feature_move_delta_avx2(
 ) noexcept {
     i16* acc_ptr = acc.data();
     for (int i = 0; i < kHidden; i += 16) {
-        __m256i acc_vec =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc_ptr + i));
-        const __m256i add_vec =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(add_weights + i));
-        const __m256i sub_vec =
-            _mm256_loadu_si256(reinterpret_cast<const __m256i*>(sub_weights + i));
+        __m256i acc_vec;
+        std::memcpy(&acc_vec, acc_ptr + i, sizeof(__m256i));
+        __m256i add_vec;
+        std::memcpy(&add_vec, add_weights + i, sizeof(__m256i));
+        __m256i sub_vec;
+        std::memcpy(&sub_vec, sub_weights + i, sizeof(__m256i));
 
         acc_vec = _mm256_add_epi16(acc_vec, _mm256_sub_epi16(add_vec, sub_vec));
 
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc_ptr + i), acc_vec);
+        std::memcpy(acc_ptr + i, &acc_vec, sizeof(__m256i));
     }
 }
 
@@ -451,8 +452,8 @@ void clear_network() noexcept {
 [[nodiscard]] inline __m256i load_weights_epi32_avx2(
     const i16* weights
 ) noexcept {
-    const __m128i w16 =
-        _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights));
+    __m128i w16;
+    std::memcpy(&w16, weights, sizeof(__m128i));
     return _mm256_cvtepi16_epi32(w16);
 }
 
@@ -472,10 +473,10 @@ void clear_network() noexcept {
 
     int i = 0;
     for (; i + 15 < kHidden; i += 16) {
-        const __m256i us16 =
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(us_ptr + i));
-        const __m256i them16 =
-            _mm256_load_si256(reinterpret_cast<const __m256i*>(them_ptr + i));
+        __m256i us16;
+        std::memcpy(&us16, us_ptr + i, sizeof(__m256i));
+        __m256i them16;
+        std::memcpy(&them16, them_ptr + i, sizeof(__m256i));
 
         const __m256i clipped_us =
             _mm256_min_epi16(_mm256_max_epi16(us16, vzero), vclip);
@@ -522,9 +523,15 @@ void clear_network() noexcept {
 #if defined(__AVX2__)
     sum = forward_dot_avx2(us, them);
 #else
-    for (int i = 0; i < kHidden; ++i) {
-        sum += static_cast<i32>(g_net.w1[i]) * screlu(static_cast<i32>(us[i]));
-        sum += static_cast<i32>(g_net.w1[kHidden + i]) * screlu(static_cast<i32>(them[i]));
+    {
+        u32 acc = 0;
+        for (int i = 0; i < kHidden; ++i) {
+            const u32 wu = static_cast<u32>(static_cast<i32>(g_net.w1[i]));
+            const u32 wt = static_cast<u32>(static_cast<i32>(g_net.w1[kHidden + i]));
+            acc += wu * static_cast<u32>(screlu(static_cast<i32>(us[i])));
+            acc += wt * static_cast<u32>(screlu(static_cast<i32>(them[i])));
+        }
+        sum = static_cast<i32>(acc);
     }
 #endif
 

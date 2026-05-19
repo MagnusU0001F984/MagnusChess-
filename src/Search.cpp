@@ -2524,7 +2524,7 @@ struct Searcher {
                     history_tables.reward_cutoff_fast(
                         pos,
                         move,
-                        depth,
+                        search_depth,
                         ply,
                         move_see_value,
                         prev_move,

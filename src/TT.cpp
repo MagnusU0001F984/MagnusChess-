@@ -248,8 +248,10 @@ void tt_resize_mb(TT& tt, std::size_t mb) {
 }
 
 void tt_new_search(TT& tt) noexcept {
-    ++tt.generation;
-    if (tt.generation == 0) tt.generation = 1;
+    if (tt.generation >= 254)
+        tt.generation = 1;
+    else
+        ++tt.generation;
 }
 
 std::size_t tt_index(const TT& tt, Key key) noexcept {

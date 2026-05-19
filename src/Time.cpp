@@ -41,6 +41,28 @@ namespace {
 
 constexpr int kMoveOverheadMs = 10;
 
+[[nodiscard]] inline int time_left_overhead(int remaining, int centi_mtg) noexcept {
+    const int current_move_overhead = kMoveOverheadMs * 2;
+    const int future_move_overhead = (kMoveOverheadMs * centi_mtg) / 100;
+    const int future_overhead_cap = std::max(kMoveOverheadMs, remaining / 10);
+    return current_move_overhead + std::min(future_move_overhead, future_overhead_cap);
+}
+
+[[nodiscard]] inline int explicit_mtg_hard_cap(
+    int remaining,
+    int increment,
+    int movestogo,
+    int optimum
+) noexcept {
+    const int moves = std::max(1, movestogo);
+    const i64 period_budget =
+        static_cast<i64>(std::max(1, remaining))
+        + static_cast<i64>(std::max(0, increment)) * std::max(0, moves - 1);
+    const int per_move_budget =
+        std::max(1, static_cast<int>(period_budget / moves));
+    return std::max(std::max(1, optimum), per_move_budget * 2);
+}
+
 [[nodiscard]] inline int game_ply_from_position(const Position& pos) noexcept {
     const int fullmove = std::max(1, pos.fullmove_number);
     return std::max(
@@ -112,9 +134,8 @@ bool TimeManager::build_limits(
         const int time_left = std::max(
             1,
             remaining
-                + (increment * (centi_mtg - 100)
-                   - kMoveOverheadMs * (200 + centi_mtg))
-                    / 100
+                + (increment * (centi_mtg - 100)) / 100
+                - time_left_overhead(remaining, centi_mtg)
         );
 
         double opt_scale = 1.0;
@@ -142,7 +163,7 @@ bool TimeManager::build_limits(
         } else {
             const double mtg = double(centi_mtg) / 100.0;
             opt_scale = std::min(
-                (0.88 + double(ply) / 116.4) / mtg,
+                0.88 / mtg,
                 0.88 * double(remaining) / double(time_left)
             );
             max_scale = 1.3 + 0.11 * mtg;
@@ -154,11 +175,20 @@ bool TimeManager::build_limits(
             static_cast<int>(0.825179 * double(remaining) - kMoveOverheadMs)
         );
         const int scaled_maximum = std::max(
-            1,
+            std::max(1, remaining / 4),
             static_cast<int>(max_scale * double(std::max(1, optimum)))
         );
-        const int maximum =
-            std::max(1, std::min(maximum_cap, scaled_maximum) - 10);
+        int maximum = std::max(1, std::min(maximum_cap, scaled_maximum));
+        if (params.movestogo > 0)
+            maximum = std::min(
+                maximum,
+                explicit_mtg_hard_cap(
+                    remaining,
+                    increment,
+                    params.movestogo,
+                    optimum
+                )
+            );
 
         if (params.ponder)
             optimum += optimum / 4;
