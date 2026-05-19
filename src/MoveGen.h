@@ -42,7 +42,7 @@ legality filter. The code keeps a simple external API while reusing the same
 helpers for captures, evasions, and full legal move lists.
 */
 
-constexpr int MAX_MOVES = 256;
+constexpr int MAX_MOVES = 384;
 
 enum GenType : int {
     GEN_CAPTURES = 0,

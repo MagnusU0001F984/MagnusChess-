@@ -2755,7 +2755,7 @@ struct Searcher {
         if (result.best_move == 0) {
             result.score = checked ? -VALUE_MATE : draw_score(root.side_to_move);
             result.best_move = 0;
-            result.seldepth = seldepth;
+            result.seldepth = 0;
             return result;
         }
 
