@@ -105,7 +105,7 @@ struct NativeNetwork {
 };
 
 NativeNetwork g_net{};
-u32 g_generation = 1;
+std::atomic<u32> g_generation{1};
 std::atomic<bool> g_loading{false};
 
 constexpr int kWinRateMaterialMin = 17;
@@ -230,7 +230,7 @@ template<typename T>
 }
 
 [[nodiscard]] inline bool accumulator_matches(const Position& pos) noexcept {
-    return pos.nnue_acc_valid && pos.nnue_generation == g_generation;
+    return pos.nnue_acc_valid && pos.nnue_generation == g_generation.load(std::memory_order_relaxed);
 }
 
 [[nodiscard]] inline int win_rate_material(const Position& pos) noexcept {
@@ -252,7 +252,7 @@ template<typename T>
 
 inline void invalidate_accumulator(Position& pos) noexcept {
     pos.nnue_acc_valid = false;
-    pos.nnue_generation = g_generation;
+    pos.nnue_generation = g_generation.load(std::memory_order_relaxed);
 }
 
 #if defined(__AVX2__)
@@ -401,7 +401,7 @@ void rebuild_accumulator(const Position& pos) noexcept {
         }
     }
 
-    pos.nnue_generation = g_generation;
+    pos.nnue_generation = g_generation.load(std::memory_order_relaxed);
     pos.nnue_acc_valid = true;
 }
 
@@ -411,9 +411,9 @@ inline void ensure_accumulator(const Position& pos) noexcept {
 }
 
 void clear_network() noexcept {
-    ++g_generation;
-    if (g_generation == 0)
-        ++g_generation;
+    u32 next_gen = g_generation.load(std::memory_order_relaxed) + 1;
+    if (next_gen == 0) next_gen = 1;
+    g_generation.store(next_gen, std::memory_order_release);
 
     g_net.is_loaded = false;
     g_net.loaded_path.clear();
@@ -674,7 +674,7 @@ const std::string& last_error() noexcept {
 
 int eval(const Position& pos) noexcept {
     if (!g_net.is_loaded || g_loading.load(std::memory_order_acquire))
-        return 0;
+        return 0; // sentinel: caller must check loaded() before calling eval()
     return forward(pos);
 }
 
