@@ -2790,6 +2790,8 @@ struct IterationTimeState {
     int best_move_changes = 0;
     int root_legal_count = 0;
     bool have_last_score = false;
+    int last_depth_time_ms = 0;   // wall time consumed by the previous completed depth
+    u64 last_depth_nodes = 0;     // nodes consumed by the previous completed depth
 };
 
 [[nodiscard]] inline bool use_stockfish_style_time_management(
@@ -2822,6 +2824,25 @@ struct IterationTimeState {
     }
 
     bool should_stop = false;
+
+    // Fixed-time grace: simple depth-boundary stop for go movetime.
+    // When the sf-style clock is disabled but a hard limit exists, avoid
+    // launching a new depth iteration that will almost certainly be
+    // interrupted mid-search.  Use the last completed depth's wall time
+    // to project whether the next depth would finish before the hard cap.
+    if (!use_stockfish_style_time_management(searcher.limits) &&
+        searcher.limits.hard_time_ms > 0 &&
+        !searcher.pondering_active() &&
+        time_state.last_depth_time_ms > 0) {
+        const int elapsed = searcher.timed_elapsed_ms();
+        const int remaining = searcher.limits.hard_time_ms - elapsed;
+        // Conservative estimate: next depth costs 2× the previous one.
+        // Require at least 65 % of that estimate to still be available.
+        const int estimated_next = (time_state.last_depth_time_ms * 2 * 65) / 100;
+        if (remaining < estimated_next)
+            should_stop = true;
+    }
+
     if (use_stockfish_style_time_management(searcher.limits) &&
         !searcher.pondering_active()) {
         // SPSA-tuned time management: falling-eval scaling, sigmoid depth factor,
@@ -3104,6 +3125,7 @@ void emit_iteration_info(
     const auto search_start = Searcher::clock::now();
     searcher.start_time = search_start;
     u64 total_nodes = 0;
+    int prev_depth_end_ms = 0;  // for fixed-time per-depth cost tracking
 #if MAGNUS_SEARCHSTATS_OBS
     u64 last_reported_nodes = 0;
 #endif
@@ -3175,6 +3197,12 @@ void emit_iteration_info(
         }
 
         total_nodes += depth_nodes;
+        {
+            const int now_ms = searcher.timed_elapsed_ms();
+            time_state.last_depth_time_ms = now_ms - prev_depth_end_ms;
+            time_state.last_depth_nodes = depth_nodes;
+            prev_depth_end_ms = now_ms;
+        }
         const bool stopped_mid_depth = searcher.stopped && best.depth > 0;
 
         if (!searcher.stopped || best.depth == 0) {
