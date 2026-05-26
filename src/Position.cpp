@@ -235,7 +235,7 @@ void position_clear(Position& pos) noexcept {
         acc.fill(0);
 
     pos.mnue_p2_generation = 0;
-    pos.mnue_p2_acc_valid = false;
+    pos.mnue_p2_acc_valid_mask = 0;
     for (auto& acc : pos.mnue_p2_acc)
         acc.fill(0);
 

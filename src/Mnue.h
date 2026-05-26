@@ -83,6 +83,9 @@ void unload_all() noexcept;
 // integration stage.
 [[nodiscard]] int eval_p2(const Position& pos) noexcept;
 [[nodiscard]] int eval_p4_lazy(const Position& pos) noexcept;
+[[nodiscard]] int debug_eval_p2_reference(const Position& pos) noexcept;
+[[nodiscard]] bool p2_i32_forward_enabled() noexcept;
+[[nodiscard]] int p2_w1_max_abs() noexcept;
 
 
 // Debug/check helper: compares persistent P2 incremental accumulator against

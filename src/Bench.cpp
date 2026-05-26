@@ -27,12 +27,14 @@ SOFTWARE.
 #include "Common.h"
 #include "Memory.h"
 #include "MoveGen.h"
+#include "Mnue.h"
 #include "Nnue.h"
 #include "Perft.h"
 #include "Position.h"
 #include "Search.h"
 
 #include <array>
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 
@@ -95,6 +97,235 @@ struct SearchBenchResult {
     if (out)
         *out << "info string failed to load nnue: " << nnue::last_error() << '\n';
     return false;
+}
+
+[[nodiscard]] std::string default_mnue_p2_file() {
+    constexpr const char* candidates[] = {
+        "6df83890b.MNUE",
+        "bin/6df83890b.MNUE",
+        "src/bin/6df83890b.MNUE"
+    };
+
+    std::error_code ec;
+    for (const char* candidate : candidates) {
+        if (std::filesystem::exists(candidate, ec) && !ec)
+            return std::string(candidate);
+    }
+
+    return std::string("6df83890b.MNUE");
+}
+
+[[nodiscard]] bool ensure_mnue_p2_loaded(
+    const std::string& eval_file,
+    std::ostream* out
+) {
+    if (mnue::p2_loaded() && mnue::p2_path() == eval_file)
+        return true;
+
+    if (mnue::load_p2(eval_file)) {
+        if (out)
+            *out << "info string loaded mnue p2 " << eval_file << '\n';
+        return true;
+    }
+
+    if (out)
+        *out << "info string failed to load mnue p2: " << mnue::last_error() << '\n';
+    return false;
+}
+
+struct EvalBenchTiming {
+    u64 micros = 0;
+    i64 checksum = 0;
+    std::size_t evals = 0;
+};
+
+template<typename EvalFn>
+[[nodiscard]] EvalBenchTiming benchmark_eval_batch(
+    const std::array<Position, SEARCH_BENCH_FENS.size()>& positions,
+    int iterations,
+    EvalFn eval_fn
+) {
+    using clock = std::chrono::steady_clock;
+
+    EvalBenchTiming result;
+    result.evals = static_cast<std::size_t>(iterations) * positions.size();
+
+    const auto start = clock::now();
+    for (int iter = 0; iter < iterations; ++iter) {
+        for (const Position& pos : positions)
+            result.checksum += static_cast<i64>(eval_fn(pos));
+    }
+    const auto end = clock::now();
+
+    result.micros = static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count()
+    );
+    return result;
+}
+
+void render_eval_bench_timing(
+    std::ostream& out,
+    std::string_view name,
+    const EvalBenchTiming& timing
+) {
+    const double seconds = static_cast<double>(timing.micros) / 1000000.0;
+    const double evals_per_second = seconds > 0.0
+        ? static_cast<double>(timing.evals) / seconds
+        : 0.0;
+
+    out << "  " << name
+        << " time_us " << timing.micros
+        << " evals_per_second " << static_cast<u64>(evals_per_second)
+        << " checksum " << timing.checksum
+        << '\n';
+}
+
+[[nodiscard]] bool prepare_eval_positions(
+    memory::Memory& mem,
+    std::array<Position, SEARCH_BENCH_FENS.size()>& positions,
+    std::ostream& out
+) {
+    for (std::size_t i = 0; i < SEARCH_BENCH_FENS.size(); ++i) {
+        if (!parse_fen(positions[i], mem, SEARCH_BENCH_FENS[i])) {
+            out << "info string failed to parse evalbench FEN: "
+                << SEARCH_BENCH_FENS[i] << '\n';
+            return false;
+        }
+    }
+
+    return true;
+}
+
+[[nodiscard]] bool check_p2_incremental(Position& pos, std::ostream& out) {
+    std::ostringstream check_log;
+    if (mnue::debug_check_p2_incremental(pos, check_log))
+        return true;
+
+    out << check_log.str();
+    return false;
+}
+
+[[nodiscard]] Move find_legal_move_by_uci(
+    const Position& pos,
+    const memory::Memory& mem,
+    std::string_view move_text
+) {
+    MoveList list{};
+    generate_legal(pos, mem, list);
+
+    for (int i = 0; i < list.size; ++i) {
+        const std::string generated = search::move_to_uci(list.moves[i]);
+        if (std::string_view(generated) == move_text)
+            return list.moves[i];
+    }
+
+    return Move(0);
+}
+
+[[nodiscard]] bool check_p2_move_roundtrip(
+    Position pos,
+    const memory::Memory& mem,
+    Move move,
+    std::ostream& out
+) {
+    if (!check_p2_incremental(pos, out))
+        return false;
+
+    StateInfo st{};
+    make_move(pos, move, mem.tables, st);
+    if (!check_p2_incremental(pos, out))
+        return false;
+
+    unmake_move(pos, move, mem.tables, st);
+    return check_p2_incremental(pos, out);
+}
+
+[[nodiscard]] bool check_p2_named_move(
+    std::string_view fen,
+    std::string_view move_text,
+    const memory::Memory& mem,
+    std::ostream& out
+) {
+    Position pos{};
+    if (!parse_fen(pos, mem, fen)) {
+        out << "info string failed to parse p2 check FEN: " << fen << '\n';
+        return false;
+    }
+
+    const Move move = find_legal_move_by_uci(pos, mem, move_text);
+    if (move_is_none(move)) {
+        out << "info string p2 check move not legal: " << move_text
+            << " in " << fen << '\n';
+        return false;
+    }
+
+    return check_p2_move_roundtrip(pos, mem, move, out);
+}
+
+[[nodiscard]] bool run_p2_incremental_smoke(
+    const std::array<Position, SEARCH_BENCH_FENS.size()>& positions,
+    const memory::Memory& mem,
+    std::ostream& out
+) {
+    int checks = 0;
+    for (const Position& root : positions) {
+        Position pos = root;
+        if (!check_p2_incremental(pos, out))
+            return false;
+        ++checks;
+
+        u32 rng = static_cast<u32>(pos.key ^ (pos.key >> 32) ^ 0x9E3779B9u);
+        for (int step = 0; step < 8; ++step) {
+            MoveList list{};
+            generate_legal(pos, mem, list);
+            if (list.size == 0)
+                break;
+
+            rng = rng * 1664525u + 1013904223u;
+            const Move move = list.moves[rng % static_cast<u32>(list.size)];
+            if (!check_p2_move_roundtrip(pos, mem, move, out))
+                return false;
+            ++checks;
+        }
+    }
+
+    const bool scenarios_ok =
+        check_p2_named_move(
+            "7k/8/8/8/8/8/8/4K3 w - - 0 1",
+            "e1f1",
+            mem,
+            out
+        ) &&
+        check_p2_named_move(
+            "7k/8/8/8/8/8/8/4K3 w - - 0 1",
+            "e1d1",
+            mem,
+            out
+        ) &&
+        check_p2_named_move(
+            "7k/8/8/8/8/8/4p3/3QK3 w - - 0 1",
+            "d1e2",
+            mem,
+            out
+        ) &&
+        check_p2_named_move(
+            "7k/P7/8/8/8/8/8/4K3 w - - 0 1",
+            "a7a8q",
+            mem,
+            out
+        ) &&
+        check_p2_named_move(
+            "r3k2r/8/8/8/8/8/8/R3K2R w KQkq - 0 1",
+            "e1g1",
+            mem,
+            out
+        );
+
+    if (!scenarios_ok)
+        return false;
+
+    out << "  p2_incremental_checks " << (checks + 5) << " ok\n";
+    return true;
 }
 
 [[nodiscard]] SearchBenchResult benchmark_search_position(
@@ -331,6 +562,87 @@ bool run_timed_search_bench(
     return true;
 }
 
+bool run_eval_bench(
+    memory::Memory& mem,
+    int iterations,
+    std::ostream& out
+) {
+    std::array<Position, SEARCH_BENCH_FENS.size()> positions{};
+    if (!prepare_eval_positions(mem, positions, out))
+        return false;
+
+    const std::string nnue_file = default_eval_file();
+    const bool nnue_ok = ensure_nnue_loaded(nnue_file, &out);
+
+    const std::string mnue_file = default_mnue_p2_file();
+    const bool mnue_ok = ensure_mnue_p2_loaded(mnue_file, &out);
+
+    if (!nnue_ok && !mnue_ok) {
+        out << "info string evalbench has no loaded evaluator\n";
+        return false;
+    }
+
+    out << "evalbench\n";
+    out << "  fens " << positions.size()
+        << " iterations " << iterations
+        << " evals " << (static_cast<std::size_t>(iterations) * positions.size())
+        << '\n';
+
+    if (mnue_ok) {
+        int mismatches = 0;
+        for (const Position& pos : positions) {
+            const int fast = mnue::eval_p2(pos);
+            const int reference = mnue::debug_eval_p2_reference(pos);
+            if (fast != reference)
+                ++mismatches;
+        }
+
+        out << "  mnue_p2_w1_max_abs " << mnue::p2_w1_max_abs()
+            << " i32_fast " << (mnue::p2_i32_forward_enabled() ? 1 : 0)
+            << " reference_mismatches " << mismatches
+            << '\n';
+
+        if (mismatches != 0)
+            return false;
+
+        if (!run_p2_incremental_smoke(positions, mem, out))
+            return false;
+    }
+
+    if (nnue_ok) {
+        for (const Position& pos : positions)
+            (void)nnue::eval(pos);
+
+        const EvalBenchTiming nnue_timing = benchmark_eval_batch(
+            positions,
+            iterations,
+            [](const Position& pos) noexcept { return nnue::eval(pos); }
+        );
+        render_eval_bench_timing(out, "nnue", nnue_timing);
+    }
+
+    if (mnue_ok) {
+        for (const Position& pos : positions)
+            (void)mnue::eval_p2(pos);
+
+        const EvalBenchTiming mnue_fast_timing = benchmark_eval_batch(
+            positions,
+            iterations,
+            [](const Position& pos) noexcept { return mnue::eval_p2(pos); }
+        );
+        render_eval_bench_timing(out, "mnue_p2_fast", mnue_fast_timing);
+
+        const EvalBenchTiming mnue_reference_timing = benchmark_eval_batch(
+            positions,
+            iterations,
+            [](const Position& pos) noexcept { return mnue::debug_eval_p2_reference(pos); }
+        );
+        render_eval_bench_timing(out, "mnue_p2_reference", mnue_reference_timing);
+    }
+
+    return true;
+}
+
 /*
  * 基準測試實作
  * parse_config() — 解析命令列參數（perft/search/timed_search 模式）
@@ -355,6 +667,10 @@ BenchConfig parse_config(int argc, char** argv) noexcept {
         cfg.timed_search = true;
         argi = 2;
     }
+    else if (argc > 1 && std::string_view(argv[1]) == "evalbench") {
+        cfg.evalbench = true;
+        argi = 2;
+    }
 
     auto parse_arg_int = [&](int idx, int default_val) noexcept {
         if (idx >= argc || !argv[idx] || !argv[idx][0])
@@ -375,7 +691,11 @@ BenchConfig parse_config(int argc, char** argv) noexcept {
         return default_val;
     };
 
-    if (cfg.search) {
+    if (cfg.evalbench) {
+        cfg.eval_iterations = std::max(1, parse_arg_int(argi, cfg.eval_iterations));
+        cfg.hash_mb = parse_arg_u64(argi + 1, cfg.hash_mb);
+        cfg.threads = 1;
+    } else if (cfg.search) {
         if (cfg.timed_search)
             cfg.search_movetime_ms = std::max(1, parse_arg_int(argi, cfg.search_movetime_ms));
         else
@@ -410,6 +730,12 @@ int run_bench(int argc, char** argv) {
         std::cerr << "position bootstrap failed\n";
         memory_free(mem);
         return 1;
+    }
+
+    if (cfg.evalbench) {
+        const bool ok = run_eval_bench(mem, cfg.eval_iterations, std::cout);
+        memory_free(mem);
+        return ok ? 0 : 1;
     }
 
     if (cfg.search) {

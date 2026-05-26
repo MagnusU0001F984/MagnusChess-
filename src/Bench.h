@@ -57,9 +57,11 @@ struct BenchConfig {
     int perft_depth = 10;
     int search_depth = 6;
     int search_movetime_ms = DEFAULT_BENCH_MOVETIME_MS;
+    int eval_iterations = 20000;
     std::size_t hash_mb = 16ULL;
     std::size_t threads = 1ULL;
     bool divide = false;
+    bool evalbench = false;
     bool search = false;
     bool timed_search = false;
     bool live_divide = false;
