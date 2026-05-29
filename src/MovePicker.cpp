@@ -72,6 +72,8 @@ MovePicker::MovePicker(
     int ply,
     Move prev_move,
     Move prev2_move,
+    Move prev4_move,
+    Move prev8_move,
     int depth,
     QuietControl quiet_control
 ) noexcept
@@ -84,6 +86,8 @@ MovePicker::MovePicker(
     , killer2_(history.killer_fast(ply, 1))
     , prev_move_(prev_move)
     , prev2_move_(prev2_move)
+    , prev4_move_(prev4_move)
+    , prev8_move_(prev8_move)
     , depth_(depth)
     , quiet_control_(quiet_control) {}
 
@@ -401,7 +405,14 @@ int MovePicker::score_capture(Move move, int see_value) const noexcept {
 }
 
 int MovePicker::score_quiet(Move move) const noexcept {
-    return history_.quiet_ordering_score_fast(pos_, move, prev_move_, prev2_move_);
+    return history_.quiet_ordering_score_fast(
+        pos_,
+        move,
+        prev_move_,
+        prev2_move_,
+        prev4_move_,
+        prev8_move_
+    );
 }
 
 MovePicker::ScoredEntry MovePicker::pick_best_entry(

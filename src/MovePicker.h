@@ -84,6 +84,8 @@ public:
         int ply,
         Move prev_move,
         Move prev2_move,
+        Move prev4_move,
+        Move prev8_move,
         int depth,
         QuietControl quiet_control = {}
     ) noexcept;
@@ -126,6 +128,8 @@ private:
     Move killer2_ = Move(0);
     Move prev_move_ = Move(0);
     Move prev2_move_ = Move(0);
+    Move prev4_move_ = Move(0);
+    Move prev8_move_ = Move(0);
     int depth_ = 0;
     QuietControl quiet_control_{};
 

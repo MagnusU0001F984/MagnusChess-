@@ -2071,8 +2071,8 @@ struct Searcher {
 
         const Move prev_move = (ply > 0) ? move_stack[ply - 1] : Move(0);
         const Move prev2_move = (ply > 1) ? move_stack[ply - 2] : Move(0);
-        const Move prev3_move = (ply > 2) ? move_stack[ply - 3] : Move(0);
         const Move prev4_move = (ply > 3) ? move_stack[ply - 4] : Move(0);
+        const Move prev8_move = (ply > 7) ? move_stack[ply - 8] : Move(0);
         QuietControl quiet_control{};
         if (!pv_node && !checked) {
             int node_history_signal = 0;
@@ -2099,6 +2099,8 @@ struct Searcher {
             ply,
             prev_move,
             prev2_move,
+            prev4_move,
+            prev8_move,
             search_depth,
             quiet_control
         );
@@ -2307,11 +2309,27 @@ struct Searcher {
                     continue;
             }
 
-            // Combined history for quiet pruning decisions (Stockfish-style):
-            // continuation history (2 ply) + pawn history.
+            // Combined history for quiet pruning decisions:
+            // split continuation history (2/4/8 ply) + pawn history.
             const int combined_history = quiet_move
-                ? history_tables.continuation_value_fast(pos, move, prev_move)
-                    + history_tables.continuation_value_fast(pos, move, prev2_move)
+                ? history_tables.continuation_value_fast(
+                        pos,
+                        move,
+                        prev2_move,
+                        CONTINUATION_PLY2_SLOT
+                    )
+                    + history_tables.continuation_value_fast(
+                        pos,
+                        move,
+                        prev4_move,
+                        CONTINUATION_PLY4_SLOT
+                    ) / 2
+                    + history_tables.continuation_value_fast(
+                        pos,
+                        move,
+                        prev8_move,
+                        CONTINUATION_PLY8_SLOT
+                    ) / 4
                     + history_tables.pawn_history_value_fast(pos, move)
                 : 0;
 
@@ -2454,8 +2472,24 @@ struct Searcher {
             if (lmr_quiet_candidate || lmr_capture_candidate)
                 gives_check = ensure_gives_check();
             const int continuation_score = quiet_move
-                ? history_tables.continuation_value_fast(pos, move, prev_move)
-                    + history_tables.continuation_value_fast(pos, move, prev2_move) / 2
+                ? history_tables.continuation_value_fast(
+                        pos,
+                        move,
+                        prev2_move,
+                        CONTINUATION_PLY2_SLOT
+                    )
+                    + history_tables.continuation_value_fast(
+                        pos,
+                        move,
+                        prev4_move,
+                        CONTINUATION_PLY4_SLOT
+                    ) / 2
+                    + history_tables.continuation_value_fast(
+                        pos,
+                        move,
+                        prev8_move,
+                        CONTINUATION_PLY8_SLOT
+                    ) / 4
                 : 0;
             const int pawn_hist_score = quiet_move
                 ? history_tables.pawn_history_value_fast(pos, move) : 0;
@@ -2673,13 +2707,10 @@ struct Searcher {
                         ply,
                         move_see_value,
                         prev_move,
-                        prev2_move
+                        prev2_move,
+                        prev4_move,
+                        prev8_move
                     );
-                    // Continuation history bonuses with linear depth decay (was quadratic).
-                    if (!move_is_capture(move)) {
-                        history_tables.bonus_continuation_fast(pos, prev3_move, move, std::max(1, search_depth / 2));
-                        history_tables.bonus_continuation_fast(pos, prev4_move, move, std::max(1, search_depth / 2));
-                    }
                     // Near-miss bonus: first few quiets that almost cut get a small reward.
                     if (!move_is_capture(move) && searched_quiet_count > 1) {
                         const int near_bonus_depth = std::max(1, search_depth / 4);
@@ -2711,8 +2742,9 @@ struct Searcher {
                             searched_quiets,
                             searched_quiet_count,
                             move,
-                            prev_move,
                             prev2_move,
+                            prev4_move,
+                            prev8_move,
                             fail_low_malus_depth
                         );
                     }
@@ -2756,17 +2788,35 @@ struct Searcher {
                 history_tables.bonus_fast(pos, best_move, hist_depth);
                 history_tables.bonus_pawn_history_fast(pos, best_move, hist_depth);
                 history_tables.penalize_quiets_fast(pos, searched_quiets, searched_quiet_count, best_move, hist_depth);
-                history_tables.bonus_continuation_fast(pos, prev_move, best_move, hist_depth);
-                history_tables.bonus_continuation_fast(pos, prev2_move, best_move, std::max(1, hist_depth / 2));
-                history_tables.bonus_continuation_fast(pos, prev3_move, best_move, std::max(1, hist_depth / 4));
-                history_tables.bonus_continuation_fast(pos, prev4_move, best_move, std::max(1, hist_depth / 4));
+                history_tables.bonus_continuation_fast(
+                    pos,
+                    prev2_move,
+                    best_move,
+                    hist_depth,
+                    CONTINUATION_PLY2_SLOT
+                );
+                history_tables.bonus_continuation_fast(
+                    pos,
+                    prev4_move,
+                    best_move,
+                    std::max(1, hist_depth / 2),
+                    CONTINUATION_PLY4_SLOT
+                );
+                history_tables.bonus_continuation_fast(
+                    pos,
+                    prev8_move,
+                    best_move,
+                    std::max(1, hist_depth / 4),
+                    CONTINUATION_PLY8_SLOT
+                );
                 history_tables.penalize_continuation_quiets_fast(
                     pos,
                     searched_quiets,
                     searched_quiet_count,
                     best_move,
-                    prev_move,
                     prev2_move,
+                    prev4_move,
+                    prev8_move,
                     hist_depth
                 );
             }

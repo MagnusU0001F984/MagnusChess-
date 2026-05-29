@@ -94,7 +94,8 @@ void HistoryTables::clear() noexcept {
     quiet = {};
     capture = {};
     countermove = {};
-    continuation = {};
+    for (auto& table : continuation)
+        table = {};
     see_bias = {};
     pawn_history = {};
 }
