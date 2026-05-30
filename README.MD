@@ -11,8 +11,8 @@ MagnusChess🦄 is a C++20 chess engine with UCI support, a classical search cor
 [cpp20-badge]: https://img.shields.io/badge/C%2B%2B-20-blue
 [uci-badge]: https://img.shields.io/badge/UCI-supported-brightgreen
 [nnue-badge]: https://img.shields.io/badge/NNUE-optional-purple
-[lgbtqp-badge]: https://img.shields.io/badge/LGBTQ%2B-friendly-ff69b4
-[trans-rights-badge]: https://img.shields.io/badge/trans-rights-5BCEFA
+[lgbtqp-badge]: https://pride-badges.pony.workers.dev/static/v1?label=lgbtq%2B%20friendly&stripeWidth=6&stripeColors=E40303,FF8C00,FFED00,008026,24408E,732982
+[trans-rights-badge]: https://pride-badges.pony.workers.dev/static/v1?label=trans%20rights&stripeWidth=6&stripeColors=5BCEFA,F5A9B8,FFFFFF,F5A9B8,5BCEFA
 
 ---
 
